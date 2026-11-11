@@ -507,14 +507,20 @@ class GoogleAuthView(APIView):
 
         # 1. Cryptographically verify the token with Google
         try:
-            client_id = settings.GOOGLE_CLIENT_ID or None
-            # If client_id is set, verify against it; otherwise verify structure and signature
+            client_id = settings.GOOGLE_CLIENT_ID.strip() if settings.GOOGLE_CLIENT_ID else None
+            # Ignore placeholder dummy value if present
+            if client_id and "your-google-client-id" in client_id:
+                client_id = None
+
+            # If client_id is None, Google verifies the real cryptographic signature & expiration 
+            # without demanding a specific audience, allowing playground tokens in development!
             id_info = id_token.verify_oauth2_token(raw_id_token, google_requests.Request(), client_id)
 
         except Exception as e:
+            error_detail = f"Invalid Google token: {str(e)}" if settings.DEBUG else "Invalid or expired Google authentication token."
             return Response(
                 {
-                    "error": "Invalid or expired Google authentication token."
+                    "error": error_detail
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
