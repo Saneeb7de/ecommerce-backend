@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'corsheaders',
     #local_apps
     'users.apps.UsersConfig',
+    'catalog.apps.CatalogConfig',
 
 ]
 

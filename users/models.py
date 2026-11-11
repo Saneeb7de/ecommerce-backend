@@ -104,3 +104,39 @@ class Address(models.Model):
 
     def __str__(self):
         return f"{self.recipient_name} - {self.city} ({'Default' if self.is_default else 'Alternate'})"
+
+
+
+class AuditLog(models.Model):
+    """
+    Immutable audit log for security, compliance (SOC-2 / PCI-DSS),
+    and forensic tracking of authentication and administrative actions.
+    """
+
+    class Action(models.TextChoices):
+        LOGIN_SUCCESS = 'LOGIN_SUCCESS', 'Login Success'
+        LOGIN_FAILED = 'LOGIN_FAILED', 'Login Failed'
+        ACCOUNT_LOCKED = 'ACCOUNT_LOCKED', 'Account Locked'
+        PASSWORD_RESET_REQUEST = 'PASSWORD_RESET_REQUEST', 'Password Reset Request'
+        PASSWORD_RESET_SUCCESS = 'PASSWORD_RESET_SUCCESS', 'Password Reset Success'
+        PASSWORD_CHANGED = 'PASSWORD_CHANGED', 'Password Changed'
+        ACCOUNT_BLOCKED = 'ACCOUNT_BLOCKED', 'Account Blocked (Deactivated)'
+        ACCOUNT_UNBLOCKED = 'ACCOUNT_UNBLOCKED', 'Account Unblocked (Activated)'
+
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="audit_logs")
+    email = models.EmailField(max_length=255, null=True, blank=True, db_index=True)
+    action = models.CharField(max_length=50, choices=Action.choices, db_index=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=500, null=True, blank=True)
+    details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'audit_logs'
+        verbose_name = 'Audit Log'
+        verbose_name_plural = 'Audit Logs'
+        ordering = ['-created_at']
+
+
+    def __str__(self):
+        return f"[{self.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {self.action} - {self.email or 'Unknown'}"
