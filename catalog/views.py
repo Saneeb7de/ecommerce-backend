@@ -19,7 +19,7 @@ from .serializers import InventorySerializer, InventoryTransactionSerializer, Ca
 
 class CustomerCategoryListView(APIView):
     """
-    GET ...catelog/categories/
+    GET ...catalog/categories/
     Public: Returns the full nested category tree (Root categories with their children).
     Only active categories are included.
     """
