@@ -717,15 +717,16 @@ class AddressDetailView(APIView):
     def put(self, request, pk):
         # Enforce ownership: only the owner can update this address
         address = get_object_or_404(Address, pk=pk, user=request.user)
-        serializer = AddressSerializer(address, data=request.data, partial=True)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        # If user is changing this address to default, unset other defaults
-        if serializer.validated_data.get("is_default") is True:
-            Address.objects.filter(user=request.user, is_default=True).exclude(pk=address.pk).update(is_default=False)
-
-        updated_address = serializer.save()
+        with transaction.atomic():
+            serializer = AddressSerializer(address, data=request.data, partial=True)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        with transaction.atomic():
+            # If user is changing this address to default, unset other defaults
+            if serializer.validated_data.get("is_default") is True:
+                Address.objects.filter(user=request.user, is_default=True).exclude(pk=address.pk).update(is_default=False)
+            updated_address = serializer.save()
         return Response(
             {
                 "message": "Address updated successfully",

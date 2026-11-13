@@ -156,23 +156,20 @@ class ProductListSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'slug', 'brand', 'category_name', 'primary_image', 'is_featured', 'starting_price', 'is_in_stock']
 
     def get_starting_price(self, obj):
-        """
-        Finds the cheapest effective_price across all ACTIVE vairants.
-        Returns None if no active variants exist (product is shell/inactive).
-        """
-        active_variants = obj.variants.filter(is_active=True)
-        if not active_variants.exists():
+        # 🚀 1. Instant read from Postgres SQL annotation (0 extra queries):
+        if hasattr(obj, 'calculated_min_price') and obj.calculated_min_price is not None:
+            return str(obj.calculated_min_price)
+        # 2. In-memory evaluation using prefetched variants (0 extra queries):
+        active_variants = [v for v in obj.variants.all() if v.is_active]
+        if not active_variants:
             return None
-        cheapest = min(var.effective_price for var in active_variants)
-        return str(cheapest)
-
+        return str(min(v.effective_price for v in active_variants))
     def get_is_in_stock(self, obj):
-        """
-        Product is in-stock if at least ONE activce variant has available stock.
-        Uses the inventory.available_quantity @property.
-        """
-
-        return obj.variants.filter(is_active=True, inventory__quantity__gt=0).exists() # at least some warehouse stock
+        # 🚀 In-memory evaluation using prefetched inventory (0 extra queries):
+        return any(
+            v.is_active and hasattr(v, 'inventory') and v.inventory.quantity > 0
+            for v in obj.variants.all()
+        )
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):

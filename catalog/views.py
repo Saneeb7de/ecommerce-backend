@@ -6,6 +6,7 @@ from django.shortcuts import get_object_or_404
 from decimal import Decimal
 from django.db import transaction
 from django.db.models import Q, F, Min, Case, When, DecimalField
+from django.core.cache import cache
 
 from users.permissions import IsAdmin
 from users.pagination import StandardResultsSetPagination
@@ -13,6 +14,7 @@ from users.pagination import StandardResultsSetPagination
 from .models import Category, Product, ProductVariant, InventoryTransaction, Inventory
 from .serializers import ProductVariantSerializer, ProductCreateUpdateSerializer, ProductDetailSerializer, ProductListSerializer, ProductVariantWriteSerializer, AdminProductDetailSerializer
 from .serializers import InventorySerializer, InventoryTransactionSerializer, CategorySerializer, CategoryTreeSerializer
+from .utils import sync_stock_to_redis
 
 # SECTION 1: CUSTOMER VIEWS
 # public browsing
@@ -27,16 +29,28 @@ class CustomerCategoryListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        cache_key = "catalog:category_tree"
+        cached_data = cache.get(cache_key)
+         # 1. Cache HIT: Return cached data with consistent response structure
+        if cached_data is not None:
+            return Response(
+                {"success": True, "count": len(cached_data), "data": cached_data, "source": "redis"},
+                  status=status.HTTP_200_OK
+            )
         # Fetch only root categories (parent=None) that are active.
         # The recursive CategoryTreeSerializer handles nesting the children automatically.
+        # 2. Cache MISS: Query PostgreSQL
         root_categories = Category.objects.filter(parent__isnull=True, is_active=True
                                                   ).prefetch_related('children').order_by('name')
         serializer = CategoryTreeSerializer(root_categories, many=True)
+        # Store in Redis for 24 hours
+        cache.set(cache_key, serializer.data, timeout=86400)
         return Response(
             {
                 "success": True,
                 "count": root_categories.count(),
                 "data": serializer.data,
+                "source": "postgres"
             },
             status=status.HTTP_200_OK
         )
@@ -135,6 +149,20 @@ class CustomerProductDetailView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, slug):
+        cache_key = f"catalog:product:{slug}"
+        cached_data = cache.get(cache_key)
+
+        # 1. Return from Redis if present
+        if cached_data is not None:
+            return Response(
+                {
+                    "success": True,
+                    "data": cached_data,
+                    "source": "redis" 
+                },
+                status=status.HTTP_200_OK
+            )
+         # 2. Query PostgreSQL on cache miss
         product = get_object_or_404(
             Product.objects.select_related('category').prefetch_related('variants__inventory'),
             slug=slug,
@@ -142,10 +170,14 @@ class CustomerProductDetailView(APIView):
             is_deleted=False,
         )
         serializer = ProductDetailSerializer(product)
+
+        # Store in Redis for 2 hours (7200 seconds)
+        cache.set(cache_key, serializer.data, timeout=7200)
         return Response(
             {
                 "success": True,
-                "data": serializer.data
+                "data": serializer.data,
+                "source": "postgres"
             },
             status=status.HTTP_200_OK
         )
@@ -158,16 +190,32 @@ class CustomerFeaturedProductsView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        cache_key = "catalog:featured_product"
+        cached_data = cache.get(cache_key)
+        # 1. Return from Redis if present
+        if cached_data is not None:
+            return Response(
+                {
+                    "success": True,
+                    "count": len(cached_data),
+                    "data": cached_data,
+                    "source": "redis"
+                },
+                status=status.HTTP_200_OK
+            )
         featured_product = Product.objects.filter(
             is_featured=True, is_published=True, is_deleted=False
         ).select_related('category').prefetch_related('variants__inventory').order_by('-created_at')[:8]
 
         serializer = ProductListSerializer(featured_product, many=True)
+        # Store in Redis for 1 hour (3600 seconds)
+        cache.set(cache_key, serializer.data, timeout=3600)
         return Response(
             {
             "success": True,
             "count": len(serializer.data),
-            "data": serializer.data
+            "data": serializer.data,
+            "source": "postgres"
             },
         status=status.HTTP_200_OK
         )
@@ -185,7 +233,7 @@ class AdminCategoryListCreateView(APIView):
     permission_classes = [IsAdmin]
 
     def get(self, request):
-        queryset = Category.objects.select_related('parent').order_by('name')
+        queryset = Category.objects.select_related('parent').order_by('-created_at')
         search_query = request.query_params.get('search', '').strip()
         if search_query:
             queryset = queryset.filter(Q(name__icontains=search_query) | Q(slug__icontains=search_query))
@@ -199,6 +247,8 @@ class AdminCategoryListCreateView(APIView):
         serializer = CategorySerializer(data=request.data)
         if serializer.is_valid():
             category = serializer.save()
+            # 💡 Purge the cached category tree:
+            cache.delete("catalog:category_tree")
             return Response(
                 {
                     "success": True,
@@ -228,11 +278,18 @@ class AdminCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CategorySerializer
     permission_classes = [IsAdmin]
 
+    def perform_update(self, serializer):
+        serializer.save()
+        # 💡 Purge cached category tree on update:
+        cache.delete("catalog:category_tree")
+
     # ⚠️ CRITICAL: You MUST override perform_destroy!
     def perform_destroy(self, instance):
         """Soft-delete instead of permanent database deletion."""
         instance.is_active = False
         instance.save(update_fields=['is_active', 'updated_at'])
+        # 💡 Purge cached category tree on delete:
+        cache.delete("catalog:category_tree")
 
 
 class AdminProductListCreateView(APIView):
@@ -266,6 +323,9 @@ class AdminProductListCreateView(APIView):
         serializer = ProductCreateUpdateSerializer(data=request.data)
         if serializer.is_valid():
             product = serializer.save()
+            # 💡 If the new product is featured, clear featured cache:
+            if product.is_featured:
+                cache.delete("catalog:featured_product")
             return Response(
                 {
                     "success": True,
@@ -303,6 +363,8 @@ class AdminProductDetailView(APIView):
         serializer = ProductCreateUpdateSerializer(product, data=request.data, partial=True)
         if serializer.is_valid():
             updated_product = serializer.save()
+            cache.delete("catalog:featured_product")
+            cache.delete(f"catalog:product:{updated_product.slug}")
             return Response(
                 {
                     "success": True,
@@ -319,6 +381,8 @@ class AdminProductDetailView(APIView):
         product = self.get_object(pk)
         product.is_deleted = True
         product.save(update_fields=['is_deleted', 'updated_at'])
+        cache.delete("catalog:featured_product")
+        cache.delete(f"catalog:product:{product.slug}")
         return Response(
             {"success": True, "message": f"Product '{product.name}' soft-deleted successfully."},
             status=status.HTTP_200_OK,
@@ -341,10 +405,12 @@ class AdminProductVariantListCreateView(APIView):
     @transaction.atomic
     def post(self, request, product_id):
         product = get_object_or_404(Product, pk=product_id, is_deleted=False)
-        serializer = ProductVariantWriteSerializer(data=request.data)
+        serializer = ProductVariantWriteSerializer(data=request.data, context={'product': product})
         if serializer.is_valid():
             # Save the new variant attached to the parent product
             variant = serializer.save(product=product)
+            # 💡 Purge PDP cache so the new variant shows up on the storefront:
+            cache.delete(f"catalog:product:{product.slug}")
 
             # Auto-initialize warehouse inventory with 0 stock
             initial_stock = int(request.data.get('initial_stock', 0))
@@ -364,6 +430,8 @@ class AdminProductVariantListCreateView(APIView):
                     reference_id="INITIAL_STOCK",
                     description="Initial stock received on variant creation.",
                 )
+
+            sync_stock_to_redis(variant.sku, initial_stock)
 
             return Response(
                  {
@@ -402,6 +470,8 @@ class AdminProductVariantDetailView(APIView):
         serializer = ProductVariantWriteSerializer(variant, data=request.data, partial=True)
         if serializer.is_valid():
             updated_variant = serializer.save()
+            # 💡 Purge PDP cache so updated price/variant shows up immediately:
+            cache.delete(f"catalog:product:{updated_variant.product.slug}")
             return Response(
                 {
                     "success": True,
@@ -418,8 +488,11 @@ class AdminProductVariantDetailView(APIView):
         variant = self.get_object(pk)
         variant.is_active = False
         variant.save(update_fields=['is_active', 'updated_at'])
+        # 💡 Purge PDP cache:
+        cache.delete(f"catalog:product:{variant.product.slug}")
         return Response({"success": True, "message": f"Variant '{variant.sku}' deactivated."},
                         status=status.HTTP_200_OK)
+
 
 
 class AdminInventoryStockAdjustView(APIView):
@@ -496,6 +569,10 @@ class AdminInventoryStockAdjustView(APIView):
         # 1. Update live stock snapshot
         inventory.quantity = new_total_quantity
         inventory.save(update_fields=['quantity', 'updated_at'])
+        cache.delete(f"catalog:product:{inventory.variant.product.slug}")
+
+        # 💡 Sync updated available stock to Redis atomic counter:
+        sync_stock_to_redis(sku, inventory.available_quantity)
 
         # 2. Append immutable ledger transaction entry
         txn = InventoryTransaction.objects.create(

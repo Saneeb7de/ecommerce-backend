@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from .models import Cart, CartItem, Wishlist
 from catalog.models import Product, ProductVariant
+from catalog.utils import check_and_reserve_redis_stock
 
 
 class CartItemSerializer(serializers.ModelSerializer):
@@ -104,6 +105,11 @@ class AddToCartSerializer(serializers.Serializer):
         if requested_qty > available_qty:
             raise serializers.ValidationError(
                 {"quantity": f"Cannot add {requested_qty} items. Only {available_qty} units available in stock."})
+
+        # 💡 4. Redis Atomic Shield: Protects against flash-sale concurrency spikes
+        has_stock = check_and_reserve_redis_stock(sku=variant.sku, requested_quantity=requested_qty, fallback_available=available_qty)
+        if not has_stock:
+            raise serializers.ValidationError({"quantity": "This item just sold out! Someone else grabbed the last units."})
 
         data['variant'] = variant
         return data

@@ -2,6 +2,7 @@ from decimal import Decimal
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
+from django.core.cache import cache
 
 from users.models import User
 from catalog.models import Category, Product, ProductVariant, Inventory, InventoryTransaction
@@ -40,6 +41,8 @@ class CategoryAPITestCase(APITestCase):
             image_url="https://example.com/electronics.jpg",
             is_active=True
         )
+        # Clear Redis cache before each test runs to guarantee test isolation
+        cache.clear()
 
     def test_admin_can_create_category_with_auto_slug(self):
         """
@@ -715,3 +718,180 @@ class CustomerCatalogDiscoveryTestCase(APITestCase):
         variant_data = product_data['variants'][0]
         self.assertEqual(variant_data['sku'], "SONY-XM5-BLK")
         self.assertEqual(variant_data['inventory']['available_quantity'], 50)
+
+
+class CatalogCacheAPITestCase(APITestCase):
+    """
+    Test suite verifying Redis Read-Through Caching and Cache Invalidation:
+    1. First request returns source='postgres' (Cache Miss).
+    2. Second request returns source='redis' (Cache Hit).
+    3. Admin mutations (create/update/delete/stock adjust) invalidate cache.
+    """
+
+    def setUp(self):
+        # Guarantee test isolation by clearing Redis before every test
+        cache.clear()
+
+        # 1. Admin user
+        self.admin = User.objects.create_user(
+            email='admin.cache@example.com',
+            name='Cache Admin',
+            password='AdminPassword123!',
+            role=User.Role.ADMIN,
+            is_staff=True,
+            is_verified=True,
+        )
+
+        # 2. Base Category & Product
+        self.category = Category.objects.create(
+            name="Audio & Headphones",
+            is_active=True
+        )
+
+        self.product = Product.objects.create(
+            category=self.category,
+            name="Sony WH-1000XM5",
+            brand="Sony",
+            description="Flagship ANC headphones",
+            primary_image="https://example.com/primary.jpg",
+            gallery_images=["https://example.com/g1.jpg", "https://example.com/g2.jpg"],
+            is_featured=True,
+            is_published=True,
+        )
+
+        self.variant = ProductVariant.objects.create(
+            product=self.product,
+            sku="SONY-XM5-BLK",
+            variant_name="Black",
+            regular_price=Decimal("399.99"),
+            sale_price=Decimal("349.99"),
+            is_active=True
+        )
+
+        self.inventory = Inventory.objects.create(
+            variant=self.variant,
+            quantity=20,
+            reserved_quantity=0,
+            low_stock_threshold=5
+        )
+
+    def test_category_tree_cache_hit_and_admin_invalidation(self):
+        """
+        1. First GET returns source='postgres'
+        2. Second GET returns source='redis'
+        3. Admin creates a new subcategory -> cache is purged -> third GET returns source='postgres'
+        """
+        url = reverse('customer-category-list')
+
+        # Request 1: Cache Miss
+        res1 = self.client.get(url)
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['source'], 'postgres')
+        self.assertEqual(res1.data['count'], 1)
+
+        # Request 2: Cache Hit
+        res2 = self.client.get(url)
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['source'], 'redis')
+        self.assertEqual(res2.data['count'], 1)
+
+        # Admin creates new category -> Must trigger cache.delete("catalog:category_tree")
+        self.client.force_authenticate(user=self.admin)
+        admin_url = reverse('admin-category-list-create')
+        self.client.post(admin_url, {"name": "Laptops & Computers"}, format='json')
+
+        # Request 3: Cache Miss (Fresh data with 2 categories)
+        self.client.force_authenticate(user=None)
+        res3 = self.client.get(url)
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertEqual(res3.data['source'], 'postgres')
+        self.assertEqual(res3.data['count'], 2)
+
+    def test_featured_products_cache_hit_and_invalidation(self):
+        """
+        1. First GET returns source='postgres'
+        2. Second GET returns source='redis'
+        3. Admin updates product -> cache is purged -> third GET returns source='postgres'
+        """
+        url = reverse('customer-featured-products')
+
+        # Request 1: Cache Miss
+        res1 = self.client.get(url)
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['source'], 'postgres')
+
+        # Request 2: Cache Hit
+        res2 = self.client.get(url)
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['source'], 'redis')
+
+        # Admin updates the product
+        self.client.force_authenticate(user=self.admin)
+        admin_url = reverse('admin-product-detail', kwargs={'pk': self.product.id})
+        self.client.put(admin_url, {"name": "Sony WH-1000XM5 Updated"}, format='json')
+
+        # Request 3: Cache Miss after invalidation
+        self.client.force_authenticate(user=None)
+        res3 = self.client.get(url)
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertEqual(res3.data['source'], 'postgres')
+        self.assertEqual(res3.data['data'][0]['name'], "Sony WH-1000XM5 Updated")
+
+    def test_product_detail_cache_hit_and_variant_invalidation(self):
+        """
+        1. First GET returns source='postgres'
+        2. Second GET returns source='redis'
+        3. Admin updates variant price -> PDP cache is purged -> next GET reflects new price
+        """
+        url = reverse('customer-product-detail', kwargs={'slug': self.product.slug})
+
+        # Request 1: Cache Miss
+        res1 = self.client.get(url)
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['source'], 'postgres')
+
+        # Request 2: Cache Hit
+        res2 = self.client.get(url)
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['source'], 'redis')
+
+        # Admin modifies variant price
+        self.client.force_authenticate(user=self.admin)
+        variant_url = reverse('admin-variant-detail', kwargs={'pk': self.variant.id})
+        self.client.put(variant_url, {"regular_price": "449.99", "sale_price": "399.99"}, format='json')
+
+        # Request 3: Cache Miss with fresh price
+        self.client.force_authenticate(user=None)
+        res3 = self.client.get(url)
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertEqual(res3.data['source'], 'postgres')
+        self.assertEqual(res3.data['data']['variants'][0]['regular_price'], "449.99")
+
+    def test_product_detail_cache_invalidated_on_stock_adjust(self):
+        """
+        When warehouse staff adjusts stock via AdminInventoryStockAdjustView,
+        PDP cache is invalidated so real-time stock reflects on the storefront.
+        """
+        url = reverse('customer-product-detail', kwargs={'slug': self.product.slug})
+
+        # Request 1 (populate cache)
+        self.client.get(url)
+        # Request 2 (verify hit)
+        res2 = self.client.get(url)
+        self.assertEqual(res2.data['source'], 'redis')
+
+        # Warehouse dock adjusts stock (+30 units)
+        self.client.force_authenticate(user=self.admin)
+        adjust_url = reverse('admin-inventory-adjust')
+        self.client.post(adjust_url, {
+            "sku": self.variant.sku,
+            "adjustment_quantity": 30,
+            "transaction_type": "PURCHASE_RECEIPT",
+            "reference_id": "PO-CACHE-TEST"
+        }, format='json')
+
+        # Request 3: Cache Miss with new available stock (20 + 30 = 50)
+        self.client.force_authenticate(user=None)
+        res3 = self.client.get(url)
+        self.assertEqual(res3.data['source'], 'postgres')
+        self.assertEqual(res3.data['data']['variants'][0]['inventory']['quantity'], 50)

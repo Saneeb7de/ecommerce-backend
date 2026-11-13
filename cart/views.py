@@ -6,6 +6,7 @@ from django.shortcuts import get_object_or_404
 from users.permissions import IsCustomer
 from .models import Cart, CartItem, Wishlist
 from .serializers import CartSerializer, CartItemSerializer, AddToCartSerializer, UpdateCartItemQuantitySerializer, WishlistItemSerializer, WishlistToggleSerializer
+from catalog.utils import release_redis_stock, check_and_reserve_redis_stock
 
 class CartDetailView(APIView):
     """
@@ -25,13 +26,22 @@ class CartDetailView(APIView):
 
     def delete(self, request):
         cart = Cart.objects.filter(user=request.user).first()
+        
         if cart:
+            # 1. Grab (sku, quantity) pairs before deleting
+            items_to_release = list(cart.items.values_list('variant__sku', 'quantity'))
+
+            # 2. Wipe the items from PostgreSQL
             cart.items.all().delete()
+
+            # 3. Restore the stock in Redis so other shoppers can buy them
+            for sku, quantity in items_to_release:
+                release_redis_stock(sku, quantity)
 
         return Response(
             {
                 "success": True, 
-                "message": "Cart cleared successfully."
+                "message": "Shopping cart emptied successfully."
             },
             status=status.HTTP_200_OK
         )
@@ -67,6 +77,7 @@ class CartItemCreateView(APIView):
         if cart_item:
             new_qty = cart_item.quantity + quantity
             if new_qty > available_quantity:
+                release_redis_stock(variant.sku, quantity)
                 return Response(
                     {
                         "success": False,
@@ -80,6 +91,8 @@ class CartItemCreateView(APIView):
         else:
             cart_item = CartItem.objects.create(cart=cart, variant=variant, quantity=quantity)
             message = f"Added '{variant.sku}' to cart."
+
+        Wishlist.objects.filter(user=request.user, product=variant.product).delete()
 
         return Response(
             {
@@ -131,6 +144,18 @@ class CartItemDetailView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # 💡 Sync the difference to Redis:
+        old_quantity = item.quantity
+        diff = new_quantity - old_quantity
+        if diff > 0:
+            # User increased quantity -> Reserve more in Redis
+            has_stock = check_and_reserve_redis_stock(item.variant.sku, diff, available_quantity)
+            if not has_stock:
+                return Response({"success": False, "message": "Cannot increase quantity; item just sold out!"}, status=status.HTTP_400_BAD_REQUEST)
+        elif diff < 0:
+            # User decreased quantity -> Return units back to Redis
+            release_redis_stock(item.variant.sku, abs(diff))
+
         item.quantity = new_quantity
         item.save(update_fields=['quantity', 'updated_at'])
 
@@ -144,12 +169,18 @@ class CartItemDetailView(APIView):
         )
 
     def delete(self, request, pk):
-        item = self.get_object(request, pk)
-        item.delete()
+        cart_item = self.get_object(request, pk)
+        sku = cart_item.variant.sku
+        qty = cart_item.quantity
+        cart_item.delete()
+        # 💡 Release stock back to Redis in-memory counter:
+        release_redis_stock(sku, qty)
+        cart, _ = Cart.objects.get_or_create(user=request.user)
         return Response(
             {
                 "success": True,
-                "message": "Item removed from cart."
+                "message": "Cart item removed from cart.",
+                "cart": CartSerializer(cart).data
             },
             status=status.HTTP_200_OK
         )
