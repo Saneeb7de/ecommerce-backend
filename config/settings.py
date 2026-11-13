@@ -217,3 +217,5 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 # In production: Change this to your real frontend domain.
 # Example: https://www.mystore.com/reset-password
 FRONTEND_RESET_URL = os.getenv("FRONTEND_RESET_URL", "http://127.0.0.1:8000/api/v1/auth/reset-password-form")
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

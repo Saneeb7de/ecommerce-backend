@@ -14,6 +14,7 @@ from users.pagination import StandardResultsSetPagination
 from .models import Category, Product, ProductVariant, InventoryTransaction, Inventory
 from .serializers import ProductVariantSerializer, ProductCreateUpdateSerializer, ProductDetailSerializer, ProductListSerializer, ProductVariantWriteSerializer, AdminProductDetailSerializer
 from .serializers import InventorySerializer, InventoryTransactionSerializer, CategorySerializer, CategoryTreeSerializer
+from .utils import sync_stock_to_redis
 
 # SECTION 1: CUSTOMER VIEWS
 # public browsing
@@ -232,7 +233,7 @@ class AdminCategoryListCreateView(APIView):
     permission_classes = [IsAdmin]
 
     def get(self, request):
-        queryset = Category.objects.select_related('parent').order_by('name')
+        queryset = Category.objects.select_related('parent').order_by('-created_at')
         search_query = request.query_params.get('search', '').strip()
         if search_query:
             queryset = queryset.filter(Q(name__icontains=search_query) | Q(slug__icontains=search_query))
@@ -322,6 +323,9 @@ class AdminProductListCreateView(APIView):
         serializer = ProductCreateUpdateSerializer(data=request.data)
         if serializer.is_valid():
             product = serializer.save()
+            # 💡 If the new product is featured, clear featured cache:
+            if product.is_featured:
+                cache.delete("catalog:featured_product")
             return Response(
                 {
                     "success": True,
@@ -426,6 +430,8 @@ class AdminProductVariantListCreateView(APIView):
                     reference_id="INITIAL_STOCK",
                     description="Initial stock received on variant creation.",
                 )
+
+            sync_stock_to_redis(variant.sku, initial_stock)
 
             return Response(
                  {
@@ -564,6 +570,9 @@ class AdminInventoryStockAdjustView(APIView):
         inventory.quantity = new_total_quantity
         inventory.save(update_fields=['quantity', 'updated_at'])
         cache.delete(f"catalog:product:{inventory.variant.product.slug}")
+
+        # 💡 Sync updated available stock to Redis atomic counter:
+        sync_stock_to_redis(sku, inventory.available_quantity)
 
         # 2. Append immutable ledger transaction entry
         txn = InventoryTransaction.objects.create(

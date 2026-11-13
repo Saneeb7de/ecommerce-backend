@@ -3,6 +3,25 @@ from .models import User, Address
 from django.contrib.auth.password_validation import validate_password # for password conditions
 
 
+
+def validate_person_name(value):
+    """
+    Validates that a name contains real letters and no digits or symbols.
+    Allows spaces, hyphens, and apostrophes (e.g. 'Mary-Jane O'Connor').
+    """
+    clean_value = value.strip()
+    if len(clean_value) < 2:
+        raise serializers.ValidationError("Name must be at least 2 characters long.")
+    # 1. Reject if any digits exist
+    if any(char.isdigit() for char in clean_value):
+        raise serializers.ValidationError("Name cannot contain numbers.")
+
+    # 2. Allow only letters, spaces and apostrophes
+    if not all(char.isalpha() or char.isspace() or char in ".'" for char in clean_value):
+        raise serializers.ValidationError("Name can only contain letters, spaces, periods, and apostrophes.")
+    return clean_value 
+
+
 #register api serializer
 class UserRegistrationSerializer(serializers.ModelSerializer):
 
@@ -12,6 +31,9 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ["name", "email", "password", "confirm_password"]
+
+    def validate_name(self, value):
+        return validate_person_name(value)
 
 
     def validate_email(self, value):
@@ -74,6 +96,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "email", "phone_number", "profile_image", "role", "sso_provider", "sso_organization", "is_sso_verified", "created_at"]
         read_only_fields = ["id", "email", "role", "sso_provider", "sso_organization", "is_sso_verified", "created_at"]
 
+    def validate_name(self, value):
+        return validate_person_name(value)
+
 
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(write_only=True)
@@ -97,6 +122,9 @@ class AddressSerializer(serializers.ModelSerializer):
         model = Address
         fields = ["id", "recipient_name", "phone_number", "street_address", "apartment_suite", "city", "state", "postal_code", "country", "address_type", "is_default", "created_at"]
         read_only_fields = ["id", "created_at"]
+
+    def validate_recipient_name(self, value):
+        return validate_person_name(value)
 
 
 #admin serializers
