@@ -49,6 +49,8 @@ INSTALLED_APPS = [
     'users.apps.UsersConfig',
     'catalog.apps.CatalogConfig',
     'cart.apps.CartConfig',
+    'orders.apps.OrdersConfig',
+    'notifications.apps.NotificationsConfig',
 
 ]
 
@@ -219,3 +221,14 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 FRONTEND_RESET_URL = os.getenv("FRONTEND_RESET_URL", "http://127.0.0.1:8000/api/v1/auth/reset-password-form")
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Razorpay Payment Gateway
+RAZORPAY_KEY_ID = os.getenv('RAZORPAY_KEY_ID', '')
+RAZORPAY_KEY_SECRET = os.getenv('RAZORPAY_KEY_SECRET', '')
+
+
+# STORE / INVOICE METADATA
+STORE_NAME = os.getenv('STORE_NAME', 'E-Commerce Store Pvt Ltd')
+STORE_GSTIN = os.getenv('STORE_GSTIN', '29AAAAA0000A1Z5')
+STORE_ADDRESS = os.getenv('STORE_ADDRESS', 'Bengaluru, Karnataka, India - 560100')
+STORE_SUPPORT_EMAIL = os.getenv('STORE_SUPPORT_EMAIL', 'support@ecommerce.com')
