@@ -27,6 +27,13 @@ from .serializers import (
 )
 from .services import PricingEngine
 from users.pagination import StandardResultsSetPagination
+from notifications.utils import send_dynamic_email
+
+  
+
+  
+
+  
 
 # Initialize Razorpay Client
 razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
@@ -176,6 +183,18 @@ class OrderCreateListView(APIView):
         if payment_method == Order.PaymentMethod.COD:
             order.payment_status = Order.PaymentStatus.PENDING
             order.save(update_fields=['payment_status'])
+            send_dynamic_email(
+                recipient_email=order.user.email,
+                template_key='ORDER_CONFIRMATION',
+                fallback_file='order_confirmation.html',
+                default_subject=f"Order Confirmed: #{order.order_number}",
+                context_dict={
+                    'order': order,
+                    'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                    'items': order.items.all(),
+                    'shipping_address': order.shipping_address_snapshot or {}
+                }
+            )
             return Response(
                 {"success": True, "message": "Order placed successfully.", "data": {"id": order.id, "order_number": order.order_number}},
                 status=status.HTTP_201_CREATED
@@ -193,6 +212,18 @@ class OrderCreateListView(APIView):
                 order.payment_status = Order.PaymentStatus.COMPLETED
                 order.status = Order.OrderStatus.CONFIRMED
                 order.save(update_fields=['payment_status', 'status'])
+                send_dynamic_email(
+                    recipient_email=order.user.email,
+                    template_key='ORDER_CONFIRMATION',
+                    fallback_file='order_confirmation.html',
+                    default_subject=f"Order Confirmed: #{order.order_number}",
+                    context_dict={
+                        'order': order,
+                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                        'items': order.items.all(),
+                        'shipping_address': order.shipping_address_snapshot or {}
+                    }
+                )
 
                 PaymentTransaction.objects.create(
                     order=order,
@@ -226,6 +257,7 @@ class OrderCreateListView(APIView):
                 amount=pricing['grand_total'],
                 status=PaymentTransaction.TransactionStatus.INITIATED,
             )
+
             return Response(
                 {
                     "success": True,
@@ -344,6 +376,18 @@ class OrderCancelView(APIView):
                 status=Order.OrderStatus.CANCELLED,
                 notes=f"Order cancelled by customer. Reason: {reason or 'Not specified'}"
             )
+
+        send_dynamic_email(
+            recipient_email=order.user.email,
+            template_key='ORDER_CANCELLED',
+            fallback_file='order_status_update.html',
+            default_subject=f"Order Cancelled: #{order.order_number}",
+            context_dict={
+                'order': order,
+                'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                'headline': 'Order Cancelled'
+            }
+        )
 
         return Response(
             {
@@ -525,6 +569,19 @@ class RazorpayVerifyPaymentView(APIView):
                 order=order,
                 status=Order.OrderStatus.CONFIRMED,
                 notes="Payment confirmed via Razorpay."
+            )
+
+            send_dynamic_email(
+                recipient_email=order.user.email,
+                template_key='ORDER_CONFIRMATION',
+                fallback_file='order_confirmation.html',
+                default_subject=f"Order Confirmed: #{order.order_number}",
+                context_dict={
+                    'order': order,
+                    'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                    'items': order.items.all(),
+                    'shipping_address': order.shipping_address_snapshot or {}
+                }
             )
 
             return Response(
@@ -732,6 +789,31 @@ class AdminOrderStatusUpdateView(APIView):
                 notes=milestone_notes
             )
 
+            if new_status == Order.OrderStatus.SHIPPED:
+                send_dynamic_email(
+                    recipient_email=order.user.email,
+                    template_key='ORDER_SHIPPED',
+                    fallback_file='order_status_update.html',
+                    default_subject=f"Your Order #{order.order_number} has been Shipped!",
+                    context_dict={
+                        'order': order,
+                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                        'headline': 'Order Shipped! 🚀'
+                    }
+                )
+            elif new_status == Order.OrderStatus.DELIVERED:
+                send_dynamic_email(
+                    recipient_email=order.user.email,
+                    template_key='ORDER_DELIVERED',
+                    fallback_file='order_status_update.html',
+                    default_subject=f"Delivered: Order #{order.order_number}",
+                    context_dict={
+                        'order': order,
+                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                        'headline': 'Order Delivered 🎉'
+                    }
+                )
+
             return Response(
                 {
                     "success": True,
@@ -851,6 +933,19 @@ class AdminReturnModerateView(APIView):
                     status=Order.OrderStatus.RETURNED,
                     notes=milestone_msg[:100]
                 )
+
+        send_dynamic_email(
+            recipient_email=return_request.user.email,
+            template_key='RETURN_STATUS',
+            fallback_file='return_status.html',
+            default_subject=f"Return Request {return_request.get_status_display()}: #{order.order_number}",
+            context_dict={
+                'order': order,
+                'customer_name': getattr(return_request.user, 'name', None) or return_request.user.email,
+                'return_status': return_request.status,
+                'admin_notes': return_request.admin_notes or ''
+            }
+        )
 
         return Response(
             {
@@ -1005,6 +1100,19 @@ class WalletTopUpVerifyView(APIView):
                 reference_id=razorpay_payment_id,
                 description=f"Wallet top-up via Razorpay ({razorpay_payment_id})"
             )
+
+        send_dynamic_email(
+            recipient_email=request.user.email,
+            template_key='WALLET_TOPUP',
+            fallback_file='wallet_topup.html',
+            default_subject=f"Wallet Credited: ₹{credit_amount}",
+            context_dict={
+                'customer_name': getattr(request.user, 'name', None) or request.user.email,
+                'amount': str(credit_amount),
+                'balance': str(wallet.balance),
+                'reference_id': razorpay_payment_id
+            }
+        )
 
         return Response(
             {

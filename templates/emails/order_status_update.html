@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Order Update</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f6f8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f4f6f8; padding: 40px 10px;">
+    <tr>
+      <td align="center">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 520px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e5e7eb;">
+          
+          <!-- Header Bar -->
+          <tr>
+            <td style="background-color: #111827; padding: 24px; text-align: center;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 700; letter-spacing: 0.5px;">E-COMMERCE STORE</h1>
+            </td>
+          </tr>
+
+          <!-- Content Body -->
+          <tr>
+            <td style="padding: 32px 30px;">
+              <h2 style="margin: 0 0 12px; color: #111827; font-size: 20px; font-weight: 600;">{{ headline }}</h2>
+              <p style="margin: 0 0 20px; color: #4b5563; font-size: 15px; line-height: 1.5;">
+                Hello <strong>{{ customer_name }}</strong>, your order <strong>#{{ order.order_number }}</strong> status has been updated to: <span style="font-weight: 700; color: #111827;">{{ order.get_status_display }}</span>.
+              </p>
+
+              {% if order.status == 'SHIPPED' %}
+              <div style="background-color: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+                <p style="margin: 4px 0; color: #1e40af;"><strong>Carrier:</strong> {{ order.carrier_name|default:"Standard Delivery" }}</p>
+                <p style="margin: 4px 0; color: #1e40af;"><strong>Tracking Number:</strong> <code style="font-weight: 700; font-size: 15px;">{{ order.tracking_number|default:"N/A" }}</code></p>
+              </div>
+              {% endif %}
+
+              {% if order.status == 'DELIVERED' %}
+              <div style="background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+                <strong style="color: #166534; display: block; margin-bottom: 4px;">7-Day Return Policy</strong>
+                <p style="margin: 0; color: #15803d; font-size: 13px; line-height: 1.4;">
+                  If you need a replacement or refund, you can submit a return request from your order dashboard within <strong>7 days</strong> of delivery.
+                </p>
+              </div>
+              {% endif %}
+
+              <p style="margin: 0; color: #6b7280; font-size: 13px;">
+                Visit your dashboard to view milestones and track order history.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #f9fafb; padding: 20px; text-align: center; border-top: 1px solid #e5e7eb;">
+              <p style="margin: 0; color: #9ca3af; font-size: 12px;">
+                &copy; 2026 E-Commerce Store. All rights reserved.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

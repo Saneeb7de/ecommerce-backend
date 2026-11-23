@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Order Confirmation</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f6f8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f4f6f8; padding: 40px 10px;">
+    <tr>
+      <td align="center">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 540px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e5e7eb;">
+          
+          <!-- Header Bar -->
+          <tr>
+            <td style="background-color: #111827; padding: 24px; text-align: center;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 700; letter-spacing: 0.5px;">E-COMMERCE STORE</h1>
+            </td>
+          </tr>
+
+          <!-- Content Body -->
+          <tr>
+            <td style="padding: 32px 30px;">
+              <h2 style="margin: 0 0 12px; color: #111827; font-size: 20px; font-weight: 600;">Order Confirmed! 🎉</h2>
+              <p style="margin: 0 0 20px; color: #4b5563; font-size: 15px; line-height: 1.5;">
+                Hello <strong>{{ customer_name }}</strong>, thank you for your order! We've received order <strong>#{{ order.order_number }}</strong>.
+              </p>
+
+              <!-- Payment Box -->
+              <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 18px; margin-bottom: 24px;">
+                <p style="margin: 3px 0; font-size: 14px; color: #374151;"><strong>Payment Method:</strong> {{ order.get_payment_method_display }}</p>
+                <p style="margin: 3px 0; font-size: 14px; color: #374151;"><strong>Payment Status:</strong> {{ order.get_payment_status_display }}</p>
+              </div>
+
+              <!-- Itemized Table -->
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 20px; border-collapse: collapse;">
+                <thead>
+                  <tr style="background-color: #f3f4f6; text-align: left; font-size: 13px; color: #6b7280;">
+                    <th style="padding: 10px 8px;">ITEM</th>
+                    <th style="padding: 10px 8px; text-align: center;">QTY</th>
+                    <th style="padding: 10px 8px; text-align: right;">TOTAL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for item in items %}
+                  <tr>
+                    <td style="padding: 10px 8px; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #111827;">
+                      {{ item.product_name_snapshot }} <span style="color: #6b7280; font-size: 12px;">({{ item.variant_name_snapshot }})</span>
+                    </td>
+                    <td style="padding: 10px 8px; border-bottom: 1px solid #f3f4f6; text-align: center; font-size: 14px; color: #374151;">{{ item.quantity }}</td>
+                    <td style="padding: 10px 8px; border-bottom: 1px solid #f3f4f6; text-align: right; font-size: 14px; color: #111827; font-weight: 500;">₹{{ item.line_total }}</td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+
+              <!-- Totals -->
+              <div style="text-align: right; font-size: 14px; color: #4b5563; line-height: 1.8; margin-bottom: 20px;">
+                <div>Subtotal: ₹{{ order.subtotal }}</div>
+                {% if order.discount_amount > 0 %}
+                <div style="color: #16a34a;">Discount: -₹{{ order.discount_amount }}</div>
+                {% endif %}
+                <div>Tax: ₹{{ order.tax_amount }}</div>
+                <div>Shipping: ₹{{ order.shipping_fee }}</div>
+                <div style="font-size: 18px; font-weight: 700; color: #111827; margin-top: 6px;">Grand Total: ₹{{ order.grand_total }}</div>
+              </div>
+
+              <!-- Shipping Address -->
+              <div style="background-color: #f9fafb; border-radius: 8px; padding: 14px 18px; font-size: 13px; color: #4b5563;">
+                <strong style="color: #111827; display: block; margin-bottom: 4px;">Delivery Address:</strong>
+                {{ shipping_address.full_name }}, {{ shipping_address.address_line_1 }}, {{ shipping_address.city }}, {{ shipping_address.state }} - {{ shipping_address.postal_code }}<br>
+                Phone: {{ shipping_address.phone_number }}
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #f9fafb; padding: 20px; text-align: center; border-top: 1px solid #e5e7eb;">
+              <p style="margin: 0; color: #9ca3af; font-size: 12px;">
+                &copy; 2026 E-Commerce Store. All rights reserved.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
