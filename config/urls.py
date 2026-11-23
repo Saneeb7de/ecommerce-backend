@@ -26,4 +26,5 @@ urlpatterns = [
     path('api/v1/', include('catalog.urls')),
     # Cart & Wishlist Endpoints under /api/v1/
     path('api/v1/', include('cart.urls')),
+    path('api/v1/', include('orders.urls')),
 ]
