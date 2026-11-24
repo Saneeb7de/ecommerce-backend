@@ -7,6 +7,12 @@ from cart.models import Cart, CartItem
 # ⚠️ This import will FAIL initially because orders/services.py does NOT exist yet!
 # That is the intentional, textbook "RED" stage of TDD.
 from orders.services import PricingEngine
+from django.test import override_settings
+from rest_framework import status
+from rest_framework.test import APITestCase
+from users.models import Address
+from orders.models import Order, Wallet, WalletTransaction
+from django.urls import reverse
 
 
 
@@ -224,3 +230,131 @@ class PricingEngineTDDTestCase(TestCase):
         wallet.debit(Decimal('300.00'), source=WalletTransaction.TransactionSource.ORDER_PAYMENT, description="Payment for Order")
         self.assertEqual(wallet.balance, Decimal('700.00'))
         self.assertEqual(wallet.transactions.count(), 2)
+
+
+from django.test import override_settings
+from rest_framework import status
+from rest_framework.test import APITestCase
+from users.models import Address
+from orders.models import Order, Wallet, WalletTransaction
+
+
+@override_settings(ALLOWED_HOSTS=['*'])
+class OrderWalletLifecycleAPITestCase(APITestCase):
+    """
+    Critical Path: Full Order Placement via Wallet & Order Cancellation Refund.
+    """
+
+    def setUp(self):
+        # 1. Verified Customer with Address & Pre-funded Wallet
+        self.customer = User.objects.create_user(
+            email='shopper.wallet@example.com',
+            name='Wallet Shopper',
+            password='SecurePassword123!',
+            role=User.Role.CUSTOMER,
+            is_verified=True
+        )
+        self.address = Address.objects.create(
+            user=self.customer,
+            recipient_name='Wallet Shopper',
+            phone_number='9876543210',
+            street_address='123 Test Street',
+            city='Bengaluru',
+            state='Karnataka',
+            postal_code='560001',
+            country='IN',
+            is_default=True
+        )
+        # Fund Wallet with ₹5,000.00
+        self.wallet = Wallet.objects.get_or_create(user=self.customer)[0]
+        self.wallet.credit(
+            amount=Decimal('5000.00'),
+            source=WalletTransaction.TransactionSource.TOP_UP,
+            description="Pre-test wallet top-up"
+        )
+
+        # 2. Category, Product, Variant (₹500 each, 20 initial stock)
+        self.category = Category.objects.create(name='Audio Gear', is_active=True)
+        self.product = Product.objects.create(
+            category=self.category,
+            name='Studio Wireless Headphones',
+            brand='AudioPro',
+            description='High performance studio monitors.',
+            primary_image='https://images.unsplash.com/photo-1505740420928-5e560c06d30e',
+            gallery_images=['https://images.unsplash.com/photo-1', 'https://images.unsplash.com/photo-2'],
+            is_published=True
+        )
+        self.variant = ProductVariant.objects.create(
+            product=self.product,
+            sku='STUDIO-HP-BLK',
+            variant_name='Matte Black',
+            regular_price=Decimal('500.00'),
+            sale_price=Decimal('500.00'),
+            is_active=True
+        )
+        self.inventory = Inventory.objects.create(
+            variant=self.variant,
+            quantity=20,
+            reserved_quantity=0
+        )
+
+        # 3. Customer Cart with 2 items (Subtotal = ₹1,000)
+        self.cart = Cart.objects.get_or_create(user=self.customer)[0]
+        self.cart_item = CartItem.objects.create(
+            cart=self.cart,
+            variant=self.variant,
+            quantity=2
+        )
+
+        self.client.force_authenticate(user=self.customer)
+
+    def test_wallet_checkout_and_cancellation_refund(self):
+        # --- STEP 1: PLACE ORDER VIA WALLET ---
+        create_url = reverse('order-create-list')
+        order_payload = {
+            "address_id": self.address.id,
+            "payment_method": "WALLET"
+        }
+        response = self.client.post(create_url, order_payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order_data = response.data['data']
+        order_number = order_data['order_number']
+
+        # Verify Order state in DB
+        order = Order.objects.get(order_number=order_number)
+        self.assertEqual(order.status, Order.OrderStatus.CONFIRMED)
+        self.assertEqual(order.payment_status, Order.PaymentStatus.COMPLETED)
+        self.assertEqual(order.payment_method, Order.PaymentMethod.WALLET)
+
+        # Verify Wallet was debited by exactly the grand total
+        self.wallet.refresh_from_db()
+        expected_balance = Decimal('5000.00') - order.grand_total
+        self.assertEqual(self.wallet.balance, expected_balance)
+
+        # Verify Stock decremented from 20 -> 18
+        self.inventory.refresh_from_db()
+        self.assertEqual(self.inventory.quantity, 18)
+
+        # Verify Cart was cleared
+        self.assertEqual(self.cart.items.count(), 0)
+
+        # --- STEP 2: CANCEL ORDER & VERIFY AUTOMATED REFUND ---
+        cancel_url = reverse('order-cancel', kwargs={'identifier': order_number})
+        cancel_payload = {"reason": "Customer requested cancellation before shipment"}
+        cancel_response = self.client.post(cancel_url, cancel_payload, format='json')
+
+        self.assertEqual(cancel_response.status_code, status.HTTP_200_OK)
+
+        # Verify Order state changed to CANCELLED & REFUNDED
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.OrderStatus.CANCELLED)
+        self.assertEqual(order.payment_status, Order.PaymentStatus.REFUNDED)
+
+        # Verify Wallet was refunded back to ₹5,000.00
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.balance, Decimal('5000.00'))
+
+        # Verify Stock was restored from 18 -> 20
+        self.inventory.refresh_from_db()
+        self.assertEqual(self.inventory.quantity, 20)
