@@ -11,7 +11,10 @@ from django.db import models
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from datetime import timedelta
 from django.db.models.functions import TruncDate, TruncMonth
+from django.core.cache import cache
+from rest_framework.throttling import ScopedRateThrottle
 
+from orders.utils import invalidate_dashboard_cache
 from users.models import User
 from users.permissions import IsAdmin, IsCustomer
 from catalog.models import Inventory, InventoryTransaction
@@ -29,6 +32,7 @@ from .services import PricingEngine
 from users.pagination import StandardResultsSetPagination
 from notifications.utils import send_dynamic_email
 
+
   
 
   
@@ -40,6 +44,8 @@ razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZOR
 
 class CheckoutPreviewView(APIView):
     permission_classes = [IsCustomer]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'coupon_apply'
 
     def post(self, request):
         serializer = CheckoutPreviewSerializer(data=request.data, context={'request': request})
@@ -67,6 +73,8 @@ class CheckoutPreviewView(APIView):
 
 class OrderCreateListView(APIView):
     permission_classes = [IsCustomer]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'checkout'
 
     def get(self, request):
         orders = Order.objects.filter(user=request.user).select_related('user').prefetch_related('items').order_by('-created_at')
@@ -195,6 +203,7 @@ class OrderCreateListView(APIView):
                     'shipping_address': order.shipping_address_snapshot or {}
                 }
             )
+            invalidate_dashboard_cache()
             return Response(
                 {"success": True, "message": "Order placed successfully.", "data": {"id": order.id, "order_number": order.order_number}},
                 status=status.HTTP_201_CREATED
@@ -237,6 +246,8 @@ class OrderCreateListView(APIView):
                     status=Order.OrderStatus.CONFIRMED,
                     notes="Payment confirmed via Wallet."
                 )
+
+            invalidate_dashboard_cache()
 
             return Response(
                 {"success": True, "message": "Order placed and paid via Wallet", "data": {"id": order.id, "order_number": order.order_number}},
@@ -377,6 +388,8 @@ class OrderCancelView(APIView):
                 notes=f"Order cancelled by customer. Reason: {reason or 'Not specified'}"
             )
 
+            invalidate_dashboard_cache()
+
         send_dynamic_email(
             recipient_email=order.user.email,
             template_key='ORDER_CANCELLED',
@@ -497,6 +510,8 @@ class OrderReturnRequestView(APIView):
 
 class RazorpayVerifyPaymentView(APIView):
     permission_classes = [IsCustomer]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'payment_verify'
 
     def post(self, request, identifier):
         serializer = RazorpayPaymentVerifySerializer(data=request.data)
@@ -571,6 +586,8 @@ class RazorpayVerifyPaymentView(APIView):
                 notes="Payment confirmed via Razorpay."
             )
 
+            invalidate_dashboard_cache()
+
             send_dynamic_email(
                 recipient_email=order.user.email,
                 template_key='ORDER_CONFIRMATION',
@@ -600,6 +617,8 @@ class RazorpayVerifyPaymentView(APIView):
 
 class RazorpayRetryPaymentView(APIView):
     permission_classes = [IsCustomer]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'payment_verify'
     
     def post(self, request, identifier):
         queryset = Order.objects.filter(user=request.user)
@@ -782,6 +801,44 @@ class AdminOrderStatusUpdateView(APIView):
                     status=PaymentTransaction.TransactionStatus.SUCCESS
                 )
 
+            if new_status == Order.OrderStatus.CANCELLED:
+                if order.payment_status == Order.PaymentStatus.COMPLETED:
+                    wallet, _ = Wallet.objects.get_or_create(user=order.user)
+                    wallet.credit(
+                        amount=order.grand_total,
+                        source=WalletTransaction.TransactionSource.ORDER_REFUND,
+                        reference_id=order.order_number,
+                        description=f"Automated refund for order {order.order_number} cancelled by admin"
+                    )
+
+                    order.payment_status = Order.PaymentStatus.REFUNDED
+                elif order.payment_status == Order.PaymentStatus.PENDING:
+                    order.payment_status = Order.PaymentStatus.FAILED
+
+                order.cancellation_reason = notes or "Cancelled by administrator"
+                order.cancelled_at = timezone.now()
+                order.save(update_fields=['payment_status', 'cancellation_reason', 'cancelled_at'])
+
+                for item in order.items.select_related('variant__inventory').all():
+                    if item.variant and hasattr(item.variant, 'inventory'):
+                        inv = Inventory.objects.select_for_update().get(id=item.variant.inventory.id)
+                        inv.quantity += item.quantity
+                        inv.save(update_fields=['quantity', 'updated_at'])
+
+                        InventoryTransaction.objects.create(
+                            inventory=inv,
+                            transaction_type=InventoryTransaction.TransactionType.ORDER_CANCELLED,
+                            quantity=item.quantity,
+                            balance_after=inv.quantity,
+                            reference_id=order.order_number,
+                            description=f"Stock restored: Order {order.order_number} cancelled by admin"
+                        )
+
+                        release_redis_stock(sku=item.sku_snapshot, quantity=item.quantity)
+                if order.coupon:
+                    CouponUsage.objects.filter(order=order, user=order.user).delete()
+                    Coupon.objects.filter(id=order.coupon_id, times_used__gt=0).update(times_used=models.F('times_used') - 1)
+
             milestone_notes = notes or f"Order status updated to {new_status} by admin."
             OrderTrackingMilestone.objects.create(
                 order=order,
@@ -813,6 +870,21 @@ class AdminOrderStatusUpdateView(APIView):
                         'headline': 'Order Delivered 🎉'
                     }
                 )
+
+            elif new_status == Order.OrderStatus.CANCELLED:
+                send_dynamic_email(
+                    recipient_email=order.user.email,
+                    template_key='ORDER_CANCELLED',
+                    fallback_file='order_status_update.html',
+                    default_subject=f"Order Cancelled: #{order.order_number}",
+                    context_dict={
+                        'order': order,
+                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
+                        'headline': 'Order Cancelled by Store'
+                    }
+                )
+            
+            invalidate_dashboard_cache()
 
             return Response(
                 {
@@ -933,6 +1005,18 @@ class AdminReturnModerateView(APIView):
                     status=Order.OrderStatus.RETURNED,
                     notes=milestone_msg[:100]
                 )
+            elif new_status == ReturnRequest.ReturnStatus.REJECTED:
+                order.status = Order.OrderStatus.DELIVERED
+                order.save(update_fields=['status', 'updated_at'])
+
+                rejection_msg = "Return rejected by admin."
+                if admin_notes:
+                    rejection_msg += f" Note: {admin_notes}"
+                OrderTrackingMilestone.objects.create(
+                    order=order,
+                    status=Order.OrderStatus.DELIVERED,
+                    notes=rejection_msg[:100]
+                )
 
         send_dynamic_email(
             recipient_email=return_request.user.email,
@@ -946,6 +1030,8 @@ class AdminReturnModerateView(APIView):
                 'admin_notes': return_request.admin_notes or ''
             }
         )
+
+        invalidate_dashboard_cache()
 
         return Response(
             {
@@ -1050,6 +1136,8 @@ class WalletTopUpCreateOrderView(APIView):
 
 class WalletTopUpVerifyView(APIView):
     permission_classes = [IsCustomer]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'payment_verify'
 
     def post(self, request):
         serializer = WalletTopUpVerifySerializer(data=request.data)
@@ -1075,12 +1163,6 @@ class WalletTopUpVerifyView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if WalletTransaction.objects.filter(reference_id=razorpay_payment_id).exists():
-            return Response(
-                {"success": False, "message": "This payment has already been credited to your wallet."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         try:
             rp_order = razorpay_client.order.fetch(razorpay_order_id)
             credit_amount = Decimal(rp_order['amount'] / Decimal(100))
@@ -1094,10 +1176,19 @@ class WalletTopUpVerifyView(APIView):
 
         with transaction.atomic():
             wallet, _ = Wallet.objects.select_for_update().get_or_create(user=request.user)
+
+            # Prevent replay attacks: Reject if this Razorpay Order ID was already credited
+            if WalletTransaction.objects.filter(reference_id=razorpay_order_id).exists() or \
+               WalletTransaction.objects.filter(description__contains=razorpay_payment_id).exists():
+                return Response(
+                    {"success": False, "message": "This payment or order has already been credited to your wallet."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             trans = wallet.credit(
                 amount=credit_amount,
                 source=WalletTransaction.TransactionSource.TOP_UP,
-                reference_id=razorpay_payment_id,
+                reference_id=razorpay_order_id,
                 description=f"Wallet top-up via Razorpay ({razorpay_payment_id})"
             )
 
@@ -1121,7 +1212,7 @@ class WalletTopUpVerifyView(APIView):
                 "data": {
                     "balance": str(wallet.balance),
                     "transaction_id": trans.id,
-                    "reference_id": razorpay_payment_id,
+                    "reference_id": razorpay_order_id,
                     "amount_credited": str(credit_amount),
                     "currency": "INR"
                 }
@@ -1313,6 +1404,8 @@ class AdminReturnRequestDetailView(APIView):
 
 class OrderInvoiceView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'invoice_download'
 
     def get(self, request, identifier):
         if request.user.role == 'ADMIN':
@@ -1390,6 +1483,11 @@ class AdminDashboardMetricsView(APIView):
         else:
             period = 'all'
 
+        cache_key = f"dashboard:metrics:{period}"
+        cached_response = cache.get(cache_key)
+        if cached_response:
+            return Response(cached_response, status=status.HTTP_200_OK)
+
         now = timezone.now()
 
         date_filter = models.Q()
@@ -1437,40 +1535,41 @@ class AdminDashboardMetricsView(APIView):
 
         pending_returns = ReturnRequest.objects.filter(status=ReturnRequest.ReturnStatus.PENDING).count()
 
-        return Response(
-            {
-                "success": True,
-                "data": {
-                    "period": period,
-                    "revenue": {
-                        "booked_sales": str(booked_sales.quantize(Decimal('0.01'))),
-                        "collected_cash": str(collected_cash.quantize(Decimal('0.01'))),
-                        "currency": "INR"
-                    },
-                    "orders": {
-                        "total_orders": totol_orders,
-                        "pending_orders": pending_orders,
-                        "in_transit_orders": in_transit_orders,
-                        "delivered_orders": delivered_orders,
-                        "cancelled_orders": cancelled_orders
-                    },
-                    "customers": {
-                        "total_customers": total_customers,
-                        "active_customers": active_customers,
-                        "new_customers_in_period": new_customers_in_period,
-                        "new_customers_last_30_days": new_customers_last_30_days
-                    },
-                    "inventory": {
-                        "low_stock_variants": low_stock_count,
-                        "out_of_stock_variants": out_of_stock_count
-                    },
-                    "returns": {
-                        "pending_returns": pending_returns
-                    }
+
+        response_payload = {
+            "success": True,
+            "data": {
+                "period": period,
+                "revenue": {
+                    "booked_sales": str(booked_sales.quantize(Decimal('0.01'))),
+                    "collected_cash": str(collected_cash.quantize(Decimal('0.01'))),
+                    "currency": "INR"
+                },
+                "orders": {
+                    "total_orders": totol_orders,
+                    "pending_orders": pending_orders,
+                    "in_transit_orders": in_transit_orders,
+                    "delivered_orders": delivered_orders,
+                    "cancelled_orders": cancelled_orders
+                },
+                "customers": {
+                    "total_customers": total_customers,
+                    "active_customers": active_customers,
+                    "new_customers_in_period": new_customers_in_period,
+                    "new_customers_last_30_days": new_customers_last_30_days
+                },
+                "inventory": {
+                    "low_stock_variants": low_stock_count,
+                    "out_of_stock_variants": out_of_stock_count
+                },
+                "returns": {
+                    "pending_returns": pending_returns
                 }
-            },
-            status=status.HTTP_200_OK
-        )
+            }
+        }
+        cache.set(cache_key, response_payload, timeout=60)
+        
+        return Response(response_payload, status=status.HTTP_200_OK)
     
 
 class AdminDashboardSalesChartView(APIView):
@@ -1491,6 +1590,10 @@ class AdminDashboardSalesChartView(APIView):
                 )
         else:
             timeline = 'week'
+        cache_key = f"dashboard:sales_chart:{timeline}"
+        cached_response = cache.get(cache_key)
+        if cached_response is not None:
+            return Response(cached_response, status=status.HTTP_200_OK)
 
         now = timezone.now()
 
@@ -1571,17 +1674,18 @@ class AdminDashboardSalesChartView(APIView):
                     "orders_count": orders_count
                 })
 
-        return Response(
-            {
-                "success": True,
-                "data": {
-                    "timeline": timeline,
-                    "summary": {
-                        "total_revenue": str(total_period_revenue.quantize(Decimal('0.01'))),
-                        "total_orders": total_period_orders
-                    },
-                    "chart_data": chart_data
-                }
-            },
-            status=status.HTTP_200_OK
-        )
+        response_payload = {
+            "success": True,
+            "data": {
+                "timeline": timeline,
+                "summary": {
+                    "total_revenue": str(total_period_revenue.quantize(Decimal('0.01'))),
+                    "total_orders": total_period_orders
+                },
+                "chart_data": chart_data
+            }
+        }
+
+        cache.set(cache_key, response_payload, timeout=60)
+
+        return Response(response_payload, status=status.HTTP_200_OK)

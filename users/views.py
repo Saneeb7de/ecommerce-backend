@@ -14,6 +14,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from django.template.loader import render_to_string
 from django.db import transaction
+from rest_framework.throttling import ScopedRateThrottle
 
 from .models import User, Address
 from .serializers import UserRegistrationSerializer, OTPSendSerializer, OTPVerifySerializer, LoginSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, UserProfileSerializer, ChangePasswordSerializer, AddressSerializer
@@ -33,6 +34,8 @@ class RegisterView(APIView):
     """
 
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'register'
 
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
@@ -272,6 +275,8 @@ class ForgotPasswordView(APIView):
     """
 
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'password_reset'
 
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
@@ -337,6 +342,8 @@ class ResetPasswordView(APIView):
     """
 
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'password_reset'
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
