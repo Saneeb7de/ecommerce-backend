@@ -1163,12 +1163,6 @@ class WalletTopUpVerifyView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if WalletTransaction.objects.filter(reference_id=razorpay_payment_id).exists():
-            return Response(
-                {"success": False, "message": "This payment has already been credited to your wallet."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         try:
             rp_order = razorpay_client.order.fetch(razorpay_order_id)
             credit_amount = Decimal(rp_order['amount'] / Decimal(100))
@@ -1182,10 +1176,19 @@ class WalletTopUpVerifyView(APIView):
 
         with transaction.atomic():
             wallet, _ = Wallet.objects.select_for_update().get_or_create(user=request.user)
+
+            # Prevent replay attacks: Reject if this Razorpay Order ID was already credited
+            if WalletTransaction.objects.filter(reference_id=razorpay_order_id).exists() or \
+               WalletTransaction.objects.filter(description__contains=razorpay_payment_id).exists():
+                return Response(
+                    {"success": False, "message": "This payment or order has already been credited to your wallet."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             trans = wallet.credit(
                 amount=credit_amount,
                 source=WalletTransaction.TransactionSource.TOP_UP,
-                reference_id=razorpay_payment_id,
+                reference_id=razorpay_order_id,
                 description=f"Wallet top-up via Razorpay ({razorpay_payment_id})"
             )
 
@@ -1209,7 +1212,7 @@ class WalletTopUpVerifyView(APIView):
                 "data": {
                     "balance": str(wallet.balance),
                     "transaction_id": trans.id,
-                    "reference_id": razorpay_payment_id,
+                    "reference_id": razorpay_order_id,
                     "amount_credited": str(credit_amount),
                     "currency": "INR"
                 }
