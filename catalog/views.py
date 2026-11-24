@@ -74,7 +74,9 @@ class CustomerProductListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        query_set = Product.objects.filter(is_published=True, is_deleted=False).select_related('category').prefetch_related('variants__inventory')
+        query_set = Product.objects.filter(
+            is_published=True, is_deleted=False, category__is_active=True, variants__is_active=True
+        ).select_related('category').prefetch_related('variants__inventory').distinct()
 
         # 1. Text Search
         search_query = request.query_params.get('search', '').strip()
@@ -168,6 +170,7 @@ class CustomerProductDetailView(APIView):
             slug=slug,
             is_published=True,
             is_deleted=False,
+            category__is_active=True,
         )
         serializer = ProductDetailSerializer(product)
 
@@ -204,8 +207,8 @@ class CustomerFeaturedProductsView(APIView):
                 status=status.HTTP_200_OK
             )
         featured_product = Product.objects.filter(
-            is_featured=True, is_published=True, is_deleted=False
-        ).select_related('category').prefetch_related('variants__inventory').order_by('-created_at')[:8]
+            is_featured=True, is_published=True, is_deleted=False, category__is_active=True, variants__is_active=True
+        ).select_related('category').prefetch_related('variants__inventory').distinct().order_by('-created_at')[:8]
 
         serializer = ProductListSerializer(featured_product, many=True)
         # Store in Redis for 1 hour (3600 seconds)

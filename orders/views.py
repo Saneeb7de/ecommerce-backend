@@ -114,6 +114,18 @@ class OrderCreateListView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+            wallet_to_debit = None
+            if payment_method == Order.PaymentMethod.WALLET:
+                wallet_to_debit = Wallet.objects.select_for_update().get(user=request.user)
+                if wallet_to_debit.balance < pricing['grand_total']:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": f"Insufficient wallet balance. Available: ₹{wallet_to_debit.balance}, Required: ₹{pricing['grand_total']}."
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
             address_snapshot = {
                 "recipient_name": address.recipient_name,
                 "phone_number": address.phone_number,
@@ -127,9 +139,11 @@ class OrderCreateListView(APIView):
 
             coupon_code = serializer.validated_data.get('coupon_code', None)
             coupon_obj = None
-
             if coupon_code:
                 coupon_obj = Coupon.objects.filter(code__iexact=coupon_code, is_active=True).first()
+
+            initial_status = Order.OrderStatus.CONFIRMED if payment_method == Order.PaymentMethod.WALLET else Order.OrderStatus.PENDING
+            initial_payment_status = Order.PaymentStatus.COMPLETED if payment_method == Order.PaymentMethod.WALLET else Order.PaymentStatus.PENDING 
 
             order = Order.objects.create(
                 user=request.user,
@@ -141,11 +155,11 @@ class OrderCreateListView(APIView):
                 shipping_fee=pricing['shipping_fee'],
                 tax_amount=pricing['tax_amount'],
                 grand_total=pricing['grand_total'],
-                status=Order.OrderStatus.PENDING,
-                payment_status=Order.PaymentStatus.PENDING,
+                status=initial_status,
+                payment_status=initial_payment_status,
             )
 
-            #  frozen OrderItem snapshots + deduct inventory
+            # Deduct inventory & create line items
             for item in pricing['items']:
                 inv = locked_inventories[item['variant_id']]
 
@@ -181,16 +195,33 @@ class OrderCreateListView(APIView):
 
             cart.items.all().delete()
 
-            OrderTrackingMilestone.objects.create(
-                order=order,
-                status=Order.OrderStatus.PENDING,
-                notes="Order placed successfully."
-            )
+            if payment_method == Order.PaymentMethod.WALLET:
+                wallet_to_debit.debit(
+                    amount=pricing['grand_total'],
+                    source=WalletTransaction.TransactionSource.ORDER_PAYMENT,
+                    reference_id=order.order_number,
+                    description=f"Payment for order {order.order_number}"
+                )
+                PaymentTransaction.objects.create(
+                    order=order,
+                    payment_method=Order.PaymentMethod.WALLET,
+                    amount=pricing['grand_total'],
+                    status=PaymentTransaction.TransactionStatus.SUCCESS
+                )
 
-        # payment dealing
-        if payment_method == Order.PaymentMethod.COD:
-            order.payment_status = Order.PaymentStatus.PENDING
-            order.save(update_fields=['payment_status'])
+                OrderTrackingMilestone.objects.create(
+                    order=order,
+                    status=Order.OrderStatus.CONFIRMED,
+                    notes="Payment confirmed via Wallet."
+                )
+            else:
+                OrderTrackingMilestone.objects.create(
+                    order=order,
+                    status=Order.OrderStatus.PENDING,
+                    notes="Order placed successfully."
+                )
+
+        if payment_method in [Order.PaymentMethod.COD, Order.PaymentMethod.WALLET]:
             send_dynamic_email(
                 recipient_email=order.user.email,
                 template_key='ORDER_CONFIRMATION',
@@ -203,54 +234,9 @@ class OrderCreateListView(APIView):
                     'shipping_address': order.shipping_address_snapshot or {}
                 }
             )
-            invalidate_dashboard_cache()
+            msg = "Order placed and paid via Wallet" if payment_method == Order.PaymentMethod.WALLET else "Order placed successfully."
             return Response(
-                {"success": True, "message": "Order placed successfully.", "data": {"id": order.id, "order_number": order.order_number}},
-                status=status.HTTP_201_CREATED
-            )
-
-        elif payment_method == Order.PaymentMethod.WALLET:
-            wallet = serializer.validated_data['wallet']
-            with transaction.atomic():
-                wallet.debit(
-                    amount=pricing['grand_total'],
-                    source=WalletTransaction.TransactionSource.ORDER_PAYMENT,
-                    reference_id=order.order_number,
-                    description=f"Payment for order {order.order_number}"
-                )
-                order.payment_status = Order.PaymentStatus.COMPLETED
-                order.status = Order.OrderStatus.CONFIRMED
-                order.save(update_fields=['payment_status', 'status'])
-                send_dynamic_email(
-                    recipient_email=order.user.email,
-                    template_key='ORDER_CONFIRMATION',
-                    fallback_file='order_confirmation.html',
-                    default_subject=f"Order Confirmed: #{order.order_number}",
-                    context_dict={
-                        'order': order,
-                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
-                        'items': order.items.all(),
-                        'shipping_address': order.shipping_address_snapshot or {}
-                    }
-                )
-
-                PaymentTransaction.objects.create(
-                    order=order,
-                    payment_method=Order.PaymentMethod.WALLET,
-                    amount=pricing['grand_total'],
-                    status=PaymentTransaction.TransactionStatus.SUCCESS,
-                )
-
-                OrderTrackingMilestone.objects.create(
-                    order=order,
-                    status=Order.OrderStatus.CONFIRMED,
-                    notes="Payment confirmed via Wallet."
-                )
-
-            invalidate_dashboard_cache()
-
-            return Response(
-                {"success": True, "message": "Order placed and paid via Wallet", "data": {"id": order.id, "order_number": order.order_number}},
+                {"success": True, "message": msg, "data": {"id": order.id, "order_number": order.order_number}},
                 status=status.HTTP_201_CREATED
             )
 
@@ -258,7 +244,7 @@ class OrderCreateListView(APIView):
             razorpay_order = razorpay_client.order.create({
                 "amount": int(pricing['grand_total'] * 100),
                 "currency": "INR",
-                "receipt": order.order_number,
+                "receipt": order.order_number,  
                 "payment_capture": 1
             })
             PaymentTransaction.objects.create(
@@ -340,13 +326,29 @@ class OrderCancelView(APIView):
         reason = serializer.validated_data.get('reason', '')
 
         with transaction.atomic():
+            lookup = {"id": int(identifier)} if str(identifier).isdigit() else {"order_number": identifier}
+
+            try:
+                order = Order.objects.select_for_update().get(user=request.user, **lookup)
+            except Order.DoesNotExist:
+                return Response({"success": False, "message": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            if not order.is_cancellable:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Order cannot be cancelled in its current state '{order.status}'. Cancellations are only permitted before shipment."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
             order.status = Order.OrderStatus.CANCELLED
             order.cancellation_reason = reason
             order.cancelled_at = timezone.now()
 
             refund_issued = False
             if order.payment_status == Order.PaymentStatus.COMPLETED:
-                wallet, _ = Wallet.objects.get_or_create(user=request.user)
+                wallet, _ = Wallet.objects.select_for_update().get_or_create(user=request.user)
                 wallet.credit(
                     amount=order.grand_total,
                     source=WalletTransaction.TransactionSource.ORDER_REFUND,
