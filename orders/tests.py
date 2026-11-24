@@ -61,7 +61,7 @@ class PricingEngineTDDTestCase(TestCase):
         self.inv_b = Inventory.objects.create(variant=self.variant_b, quantity=10)
 
         # 4. Shopping Cart
-        self.cart = Cart.objects.create(user=self.customer)
+        self.cart = Cart.objects.get_or_create(user=self.customer)[0]
 
     def test_tiered_shipping_fee_below_threshold(self):
         """

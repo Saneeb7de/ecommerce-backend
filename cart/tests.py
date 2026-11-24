@@ -127,7 +127,7 @@ class CartAPITestCase(APITestCase):
         """
         self.client.force_authenticate(user=self.customer)
         # Pre-add item (qty = 1)
-        cart = Cart.objects.create(user=self.customer)
+        cart = Cart.objects.get_or_create(user=self.customer)[0]
         item = CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
         patch_url = reverse('cart-item-detail', kwargs={'pk': item.id})
         response = self.client.patch(patch_url, {"quantity": 4}, format='json')
@@ -142,7 +142,7 @@ class CartAPITestCase(APITestCase):
         Security Isolation: Customer B cannot edit or delete Customer A's cart items.
         """
         # Create Customer A's cart item
-        cart_a = Cart.objects.create(user=self.customer)
+        cart_a = Cart.objects.get_or_create(user=self.customer)[0]
         item_a = CartItem.objects.create(cart=cart_a, variant=self.variant, quantity=1)
         # Login as Customer B and try to modify Customer A's item:
         self.client.force_authenticate(user=self.other_customer)
@@ -156,7 +156,7 @@ class CartAPITestCase(APITestCase):
         DELETE /api/v1/cart/items/<id> removes specific line item.
         """
         self.client.force_authenticate(user=self.customer)
-        cart = Cart.objects.create(user=self.customer)
+        cart = Cart.objects.get_or_create(user=self.customer)[0]
         item = CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
         delete_url = reverse('cart-item-detail', kwargs={'pk': item.id})
         response = self.client.delete(delete_url)
@@ -168,7 +168,7 @@ class CartAPITestCase(APITestCase):
         DELETE /api/v1/cart removes all items from the customer's cart.
         """
         self.client.force_authenticate(user=self.customer)
-        cart = Cart.objects.create(user=self.customer)
+        cart = Cart.objects.get_or_create(user=self.customer)[0]
         CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
         clear_url = reverse('cart-detail')
         response = self.client.delete(clear_url)

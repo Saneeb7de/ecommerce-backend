@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
 from decimal import Decimal
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import Q, F, Min, Case, When, DecimalField
 from django.core.cache import cache
 
@@ -249,7 +249,16 @@ class AdminCategoryListCreateView(APIView):
     def post(self, request):
         serializer = CategorySerializer(data=request.data)
         if serializer.is_valid():
-            category = serializer.save()
+            try:
+                category = serializer.save()
+            except IntegrityError:
+                return Response(
+                    {
+                        "success": False,
+                        "errors": {"name": ["A category with this name or slug already exists."]}
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             # 💡 Purge the cached category tree:
             cache.delete("catalog:category_tree")
             return Response(
