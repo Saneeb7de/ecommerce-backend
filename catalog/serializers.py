@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils.text import slugify
 
 from .models import Category, Product, ProductVariant, Inventory, InventoryTransaction
 
@@ -16,6 +17,14 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'slug', 'description', 'parent', 'parent_name', 'image_url', 'is_active', 'created_at', 'updated_at']
         read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
 
+    def validate_name(self, value):
+        slug = slugify(value)
+        qs = Category.objects.filter(slug=slug)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(f"A category with the name '{value}' already exists.")
+        return value
 
 class CategoryTreeSerializer(serializers.ModelSerializer):
     """
