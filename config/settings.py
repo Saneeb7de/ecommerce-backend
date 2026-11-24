@@ -173,9 +173,16 @@ REST_FRAMEWORK = {
     ),
     # Throttle / Rate Limiting Rates (stored in Redis)
     'DEFAULT_THROTTLE_RATES': {
-        'auth_email': '10/minute',      # Max 10 login requests per minute per email
-        'otp_send': '3/minute',         # Max 3 OTP requests per minute per email (Use 'minute', not '5minute')
-        'anon': '60/minute',            # General IP defense against automated bot floods
+        'anon': '100/minute',            # General IP defense against automated scrapers/bots
+        'user': '300/minute',            # Generous baseline ceiling for logged-in users
+        'auth_email': '10/minute',       # Max 10 login attempts per minute per email
+        'otp_send': '3/minute',          # Max 3 OTP requests per minute per email
+        'register': '50/minute',          # Prevent bot account creation spam
+        'password_reset': '3/minute',    # Prevent email bombing on password reset
+        'coupon_apply': '10/minute',     # Prevent coupon code dictionary attacks
+        'checkout': '10/minute',         # Prevent order spamming / stock exhaustion
+        'payment_verify': '10/minute',   # Prevent carding attacks / signature spam
+        'invoice_download': '15/minute', # CPU protection against PDF generation spam
     },
 }
 
