@@ -143,6 +143,24 @@ class CategoryAPITestCase(APITestCase):
         public_res = self.client.get(public_url)
         self.assertEqual(public_res.data['count'], 0)
 
+    def test_duplicate_category_name_returns_400(self):
+        """
+        Verify that attempting to create a category with an existing name/slug
+        cleanly returns 400 Bad Request instead of an unhandled 500 IntegrityError.
+        """
+        self.client.force_authenticate(user=self.admin)
+        url = reverse('admin-category-list-create')
+        payload = {"name": "Wearable Tech", "is_active": True}
+
+        # 1. First creation succeeds (201 Created)
+        res1 = self.client.post(url, payload, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        # 2. Duplicate creation cleanly returns 400 Bad Request
+        res2 = self.client.post(url, payload, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('name', res2.data.get('errors', {}))
+
 
 class ProductAPITestCase(APITestCase):
     """
