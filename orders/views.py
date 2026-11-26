@@ -712,6 +712,24 @@ class AdminOrderListView(APIView):
         if payment_method_filter:
             queryset = queryset.filter(payment_method=payment_method_filter.upper())
 
+        order_id_param = (request.query_params.get('order_id') or '').strip()
+        if order_id_param:
+            if order_id_param.isdigit():
+                queryset = queryset.filter(id=int(order_id_param))
+            else:
+                queryset = queryset.filter(order_number__icontains=order_id_param)
+
+        search_query = (request.query_params.get('search') or request.query_params.get('q') or '').strip()
+        if search_query:
+            q_filter = (
+                models.Q(order_number__icontains=search_query) |
+                models.Q(user__email__icontains=search_query) |
+                models.Q(user__name__icontains=search_query)
+            )
+            if search_query.isdigit():
+                q_filter |= models.Q(id=int(search_query))
+            queryset = queryset.filter(q_filter)
+
         paginator = StandardResultsSetPagination()
         paginated_orders = paginator.paginate_queryset(queryset, request)
         serializer = OrderListSerializer(paginated_orders, many=True)

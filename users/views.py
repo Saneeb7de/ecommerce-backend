@@ -1,3 +1,5 @@
+import time
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -395,10 +397,6 @@ class ResetPasswordFormView(View):
 
 
 class LogoutView(APIView):
-    """
-    Protected endpoint: Invalidated the user's refresh token via Redis blacklist.
-    Requires: Authorization Bearer <access_token> in header.
-    """
 
     permission_classes = [IsAuthenticated]
 
@@ -414,19 +412,35 @@ class LogoutView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
-            # blacklist token by saving its unque jti in redis for 7 days (604800 seconds)
-            jti = token["jti"]
-            blacklist_key = f"blacklist_token:{jti}"
+            if str(token.get("user_id")) != str(request.user.id):
+                return Response(
+                    {"error": "Refresh token does not belongs to the authenticated user."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            refresh_jti = token["jti"]
+            blacklist_key = f"blacklist_token:{refresh_jti}"
 
             if cache.get(blacklist_key):
                 return Response(
                     {"error": "This token has already been logged out."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            cache.set(blacklist_key, True, timeout=7*24*60*60)
+
+            refresh_exp = token.get("exp")
+            refresh_ttl = max(1, int(refresh_exp - time.time())) if refresh_exp else 7 * 24 * 60 * 60
+
+            cache.set(blacklist_key, True, refresh_ttl)
+
+            if request.auth and "jti" in request.auth:
+                access_jti = request.auth["jti"]
+                access_exp = request.auth.get("exp")
+                access_ttl = max(1, int(access_exp - time.time())) if access_exp else 60 * 60
+                cache.set(f"blacklist_access_token:{access_jti}", True, timeout=access_ttl)
+
             return Response(
                 {
-                    "message": "Logged out successfully. Token invalidated."
+                    "message": "Logged out successfully. Access and refresh tokens invalidated."
                 },
                 status=status.HTTP_200_OK
             )
