@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 import secrets
 from django .views import View
 from django.core.cache import cache
@@ -15,6 +16,7 @@ from google.auth.transport import requests as google_requests
 from django.template.loader import render_to_string
 from django.db import transaction
 from rest_framework.throttling import ScopedRateThrottle
+import time
 
 from .models import User, Address
 from .serializers import UserRegistrationSerializer, OTPSendSerializer, OTPVerifySerializer, LoginSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, UserProfileSerializer, ChangePasswordSerializer, AddressSerializer
@@ -36,6 +38,7 @@ class RegisterView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'register'
+    authentication_classes = []
 
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
@@ -64,6 +67,7 @@ class VerifyOTPView(APIView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def post(self, request):
         serializer = OTPVerifySerializer(data=request.data)
@@ -90,6 +94,12 @@ class VerifyOTPView(APIView):
         #     )
         # commented out and removed the  manually checking everywhere and using the inbuilt shortcut - 
         user = get_object_or_404(User, email=email)
+
+        if not user.is_active:
+            return Response(
+                {"error": "Your account has been deactivated / blocked. Please contact support."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         # 3. Mark user as verified
         user.is_verified = True
@@ -124,6 +134,7 @@ class ResendOTPView(APIView):
 
     permission_classes = [AllowAny]
     throttle_classes = [OTPSendThrottle]
+    authentication_classes = []
 
     def post(self, request):
         serializer = OTPSendSerializer(data=request.data)
@@ -170,6 +181,7 @@ class LoginAPI(APIView):
 
     permission_classes = [AllowAny]
     throttle_classes = [AuthEmailThrottle]
+    authentication_classes = []
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
@@ -196,6 +208,12 @@ class LoginAPI(APIView):
         user = authenticate(request, email=email, password=password)
         # user = get_object_or_404(User, email=email)
         if not user:
+            existing_user = User.objects.filter(email=email).first()
+            if existing_user and not existing_user.is_active and existing_user.check_password(password):
+                return Response(
+                    {"error": "Your account has been deactivated / blocked. Please contact support."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             # Increment failed attempts in Redis (15-min TTL)
             failed_attempts = cache.get(attempts_key, 0) + 1
             cache.set(attempts_key, failed_attempts, timeout=900)
@@ -227,6 +245,8 @@ class LoginAPI(APIView):
                     }, 
                     status=status.HTTP_403_FORBIDDEN
                 )
+
+            
 
             remaining = 5 - failed_attempts
             return Response(
@@ -277,6 +297,7 @@ class ForgotPasswordView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'password_reset'
+    authentication_classes = []
 
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
@@ -344,6 +365,7 @@ class ResetPasswordView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'password_reset'
+    authentication_classes = []
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
@@ -414,24 +436,34 @@ class LogoutView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
-            # blacklist token by saving its unque jti in redis for 7 days (604800 seconds)
-            jti = token["jti"]
-            blacklist_key = f"blacklist_token:{jti}"
-
+            if str(token.get("user_id")) != str(request.user.id):
+                return Response(
+                    {"error": "Refresh token does not belong to the authenticated user."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            refresh_jti = token["jti"]
+            blacklist_key = f"blacklist_token:{refresh_jti}"
             if cache.get(blacklist_key):
                 return Response(
                     {"error": "This token has already been logged out."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            cache.set(blacklist_key, True, timeout=7*24*60*60)
+            refresh_exp = token.get("exp")
+            refresh_ttl = max(1, int(refresh_exp - time.time())) if refresh_exp else 7 * 24 * 60 * 60
+            cache.set(blacklist_key, True, timeout=refresh_ttl)
+            # Blacklist the active access token for its remaining lifetime
+            if request.auth and "jti" in request.auth:
+                access_jti = request.auth["jti"]
+                access_exp = request.auth.get("exp")
+                access_ttl = max(1, int(access_exp - time.time())) if access_exp else 60 * 60
+                cache.set(f"blacklist_access_token:{access_jti}", True, timeout=access_ttl)
             return Response(
                 {
-                    "message": "Logged out successfully. Token invalidated."
+                    "message": "Logged out successfully. Access and refresh tokens invalidated."
                 },
                 status=status.HTTP_200_OK
             )
-
-        except Exception:
+        except (TokenError, KeyError, ValueError, TypeError):
             return Response(
                 {
                     "error": "Invalid or expired refresh token."
@@ -447,6 +479,7 @@ class CustomTokenRefreshView(TokenRefreshView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def post(self, request, *args, **kwargs):
         # Support both 'refresh' and 'refresh_token' keys in JSON body
@@ -470,6 +503,12 @@ class CustomTokenRefreshView(TokenRefreshView):
                         "error": "This refresh token has been logged out and invalidated."
                     },
                     status=status.HTTP_401_UNAUTHORIZED
+                )
+            user = User.objects.filter(id=token.get("user_id")).first()
+            if not user or not user.is_active:
+                return Response(
+                    {"error": "Account is disabled or does not exist."},
+                    status=status.HTTP_403_FORBIDDEN,
                 )
 
         except Exception:
@@ -504,6 +543,7 @@ class GoogleAuthView(APIView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def post(self, request):
         serializer = GoogleAuthSerializer(data=request.data)
@@ -724,10 +764,9 @@ class AddressDetailView(APIView):
     def put(self, request, pk):
         # Enforce ownership: only the owner can update this address
         address = get_object_or_404(Address, pk=pk, user=request.user)
-        with transaction.atomic():
-            serializer = AddressSerializer(address, data=request.data, partial=True)
-            if not serializer.is_valid():
-                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer = AddressSerializer(address, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             
         with transaction.atomic():
             # If user is changing this address to default, unset other defaults
@@ -792,6 +831,7 @@ class AdminLoginAPI(APIView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
@@ -909,18 +949,13 @@ class AdminCustomerStatusView(APIView):
         customer = get_object_or_404(User, pk=pk, role=User.Role.CUSTOMER)
 
         is_active = request.data.get("is_active")
-        if is_active is None:
+        if not isinstance(is_active, bool):
             return Response(
-                {
-                    "error": "'is_active' boolean field (true/false) is required."
-                },
+                {"error": "'is_active' boolean field (true/false) is required."},
                 status=status.HTTP_400_BAD_REQUEST
-            ) 
-
-        # update active status
-        customer.is_active = bool(is_active)
+            )
+        customer.is_active = is_active
         customer.save(update_fields=["is_active"])
-
         action = "activated (unblocked)" if customer.is_active else "deactivated (blocked)"
 
         return Response(

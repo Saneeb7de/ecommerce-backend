@@ -31,13 +31,9 @@ from .serializers import (
 from .services import PricingEngine
 from users.pagination import StandardResultsSetPagination
 from notifications.utils import send_dynamic_email
+from .utils import _order_lookup, MAX_PG_BIGINT
 
 
-  
-
-  
-
-  
 
 # Initialize Razorpay Client
 razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
@@ -139,8 +135,13 @@ class OrderCreateListView(APIView):
 
             coupon_code = serializer.validated_data.get('coupon_code', None)
             coupon_obj = None
-            if coupon_code:
-                coupon_obj = Coupon.objects.filter(code__iexact=coupon_code, is_active=True).first()
+            if coupon_code and coupon_code.strip():
+                coupon_obj = Coupon.objects.select_for_update().filter(code__iexact=coupon_code.strip(), is_active=True).first()
+                if not coupon_obj:
+                    return Response({"success": False, "message": f"Invalid or expired coupon code '{coupon_code}'."}, status=status.HTTP_400_BAD_REQUEST)
+                is_valid, coupon_err = coupon_obj.is_valid_for_cart(request.user, pricing['subtotal'])
+                if not is_valid:
+                    return Response({"success": False, "message": coupon_err}, status=status.HTTP_400_BAD_REQUEST)
 
             initial_status = Order.OrderStatus.CONFIRMED if payment_method == Order.PaymentMethod.WALLET else Order.OrderStatus.PENDING
             initial_payment_status = Order.PaymentStatus.COMPLETED if payment_method == Order.PaymentMethod.WALLET else Order.PaymentStatus.PENDING 
@@ -241,12 +242,22 @@ class OrderCreateListView(APIView):
             )
 
         elif payment_method == Order.PaymentMethod.RAZORPAY:
-            razorpay_order = razorpay_client.order.create({
-                "amount": int(pricing['grand_total'] * 100),
-                "currency": "INR",
-                "receipt": order.order_number,  
-                "payment_capture": 1
-            })
+            try:
+                razorpay_order = razorpay_client.order.create({
+                    "amount": int(pricing['grand_total'] * 100),
+                    "currency": "INR",
+                    "receipt": order.order_number,
+                    "payment_capture": 1
+                })
+            except Exception as e:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Order created, but Razorpay payment session failed: {str(e)}. Please retry payment.",
+                        "data": {"id": order.id, "order_number": order.order_number},
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
             PaymentTransaction.objects.create(
                 order=order,
                 payment_method=Order.PaymentMethod.RAZORPAY,
@@ -280,7 +291,7 @@ class OrderDetailView(APIView):
 
         # Dual lookup- numeric ID or order_number
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
 
@@ -310,7 +321,7 @@ class OrderCancelView(APIView):
 
         queryset = Order.objects.filter(user=request.user)
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
 
@@ -326,7 +337,7 @@ class OrderCancelView(APIView):
         reason = serializer.validated_data.get('reason', '')
 
         with transaction.atomic():
-            lookup = {"id": int(identifier)} if str(identifier).isdigit() else {"order_number": identifier}
+            lookup = _order_lookup(identifier)
 
             try:
                 order = Order.objects.select_for_update().get(user=request.user, **lookup)
@@ -425,7 +436,7 @@ class OrderTrackingView(APIView):
     def get(self, request, identifier):
         queryset = Order.objects.filter(user=request.user).prefetch_related('milestones')
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
 
@@ -451,7 +462,7 @@ class OrderReturnRequestView(APIView):
     def post(self, request, identifier):
         queryset = Order.objects.filter(user=request.user)
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
 
@@ -523,64 +534,79 @@ class RazorpayVerifyPaymentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        queryset = Order.objects.filter(user=request.user)
-        if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
-        else:
-            order = get_object_or_404(queryset, order_number=identifier)
-
-        if order.payment_method != Order.PaymentMethod.RAZORPAY:
-            return Response(
-                {"success": False, "message": "This order does not use Razorpay payment."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if order.payment_status == Order.PaymentStatus.COMPLETED:
-            return Response(
-                {"success": False, "message": "Payment already verified for this order."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         razorpay_order_id = serializer.validated_data['razorpay_order_id']
         razorpay_payment_id = serializer.validated_data['razorpay_payment_id']
         razorpay_signature = serializer.validated_data['razorpay_signature']
 
-        try:
-            razorpay_client.utility.verify_payment_signature({
-                'razorpay_order_id': razorpay_order_id,
-                'razorpay_payment_id': razorpay_payment_id,
-                'razorpay_signature': razorpay_signature,
-            })
-        except razorpay.errors.SignatureVerificationError:
-            # Record the failed attempt for audit trail
-            PaymentTransaction.objects.create(
-                order=order,
-                payment_method=Order.PaymentMethod.RAZORPAY,
-                razorpay_order_id=razorpay_order_id,
-                razorpay_payment_id=razorpay_payment_id,
-                razorpay_signature=razorpay_signature,
-                amount=order.grand_total,
-                status=PaymentTransaction.TransactionStatus.FAILED,
-            )
-            return Response(
-                {"success": False, "message": "Payment verification failed. Invalid signature."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        id_str = str(identifier).strip()
+        is_valid_pk = id_str.isdigit() and int(id_str) <= 9223372036854775807
+        lookup = {"id": int(id_str)} if is_valid_pk else {"order_number": id_str}
 
         with transaction.atomic():
+            order = get_object_or_404(
+                Order.objects.select_for_update().filter(user=request.user),
+                **lookup
+            )
+
+            if order.payment_method != Order.PaymentMethod.RAZORPAY:
+                return Response(
+                    {"success": False, "message": "This order does not use Razorpay payment."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if order.payment_status == Order.PaymentStatus.COMPLETED:
+                return Response(
+                    {"success": False, "message": "Payment already verified for this order."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if order.status != Order.OrderStatus.PENDING:
+                return Response(
+                    {"success": False, "message": f"Cannot verify payment for order in '{order.status}' status."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            pending_txn = PaymentTransaction.objects.select_for_update().filter(
+                order=order,
+                razorpay_order_id=razorpay_order_id,
+                status=PaymentTransaction.TransactionStatus.INITIATED,
+            ).first()
+            if not pending_txn:
+                return Response(
+                    {"success": False, "message": "Razorpay order ID does not match an active payment session for this order."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            try:
+                razorpay_client.utility.verify_payment_signature({
+                    'razorpay_order_id': razorpay_order_id,
+                    'razorpay_payment_id': razorpay_payment_id,
+                    'razorpay_signature': razorpay_signature,
+                })
+            except razorpay.errors.SignatureVerificationError:
+                if not PaymentTransaction.objects.filter(razorpay_payment_id=razorpay_payment_id).exists():
+                    PaymentTransaction.objects.create(
+                        order=order,
+                        payment_method=Order.PaymentMethod.RAZORPAY,
+                        razorpay_order_id=razorpay_order_id,
+                        razorpay_payment_id=razorpay_payment_id,
+                        razorpay_signature=razorpay_signature,
+                        amount=order.grand_total,
+                        status=PaymentTransaction.TransactionStatus.FAILED,
+                    )
+                return Response(
+                    {"success": False, "message": "Payment verification failed. Invalid signature."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             order.payment_status = Order.PaymentStatus.COMPLETED
             order.status = Order.OrderStatus.CONFIRMED
             order.save(update_fields=['payment_status', 'status', 'updated_at'])
 
-            PaymentTransaction.objects.filter(
-                order=order,
-                razorpay_order_id=razorpay_order_id,
-                status=PaymentTransaction.TransactionStatus.INITIATED
-            ).update(
-                razorpay_payment_id=razorpay_payment_id,
-                razorpay_signature=razorpay_signature,
-                status=PaymentTransaction.TransactionStatus.SUCCESS
-            )
+            pending_txn.razorpay_payment_id = razorpay_payment_id
+            pending_txn.razorpay_signature = razorpay_signature
+            pending_txn.status = PaymentTransaction.TransactionStatus.SUCCESS
+            pending_txn.save(update_fields=['razorpay_payment_id', 'razorpay_signature', 'status', 'updated_at'])
 
             OrderTrackingMilestone.objects.create(
                 order=order,
@@ -590,7 +616,7 @@ class RazorpayVerifyPaymentView(APIView):
 
             invalidate_dashboard_cache()
 
-            send_dynamic_email(
+            transaction.on_commit(lambda: send_dynamic_email(
                 recipient_email=order.user.email,
                 template_key='ORDER_CONFIRMATION',
                 fallback_file='order_confirmation.html',
@@ -598,24 +624,24 @@ class RazorpayVerifyPaymentView(APIView):
                 context_dict={
                     'order': order,
                     'customer_name': getattr(order.user, 'name', None) or order.user.email,
-                    'items': order.items.all(),
+                    'items': list(order.items.all()),
                     'shipping_address': order.shipping_address_snapshot or {}
                 }
-            )
+            ))
 
             return Response(
-            {
-                "success": True,
-                "message": "Payment verified. Order confirmed.",
-                "data": {
-                    "order_number": order.order_number,
-                    "status": order.status,
-                    "payment_status": order.payment_status,
-                    "razorpay_payment_id": razorpay_payment_id,
-                }
-            },
-            status=status.HTTP_200_OK
-        )
+                {
+                    "success": True,
+                    "message": "Payment verified. Order confirmed.",
+                    "data": {
+                        "order_number": order.order_number,
+                        "status": order.status,
+                        "payment_status": order.payment_status,
+                        "razorpay_payment_id": razorpay_payment_id,
+                    }
+                },
+                status=status.HTTP_200_OK
+            )
 
 class RazorpayRetryPaymentView(APIView):
     permission_classes = [IsCustomer]
@@ -625,7 +651,7 @@ class RazorpayRetryPaymentView(APIView):
     def post(self, request, identifier):
         queryset = Order.objects.filter(user=request.user)
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
 
@@ -712,6 +738,25 @@ class AdminOrderListView(APIView):
         if payment_method_filter:
             queryset = queryset.filter(payment_method=payment_method_filter.upper())
 
+        max_pg_bigint = 9223372036854775807
+        order_id_param = (request.query_params.get('order_id') or '').strip()
+        if order_id_param:
+            if order_id_param.isdigit() and int(order_id_param) <= max_pg_bigint:
+                queryset = queryset.filter(id=int(order_id_param))
+            else:
+                queryset = queryset.filter(order_number__icontains=order_id_param)
+        search_query = (request.query_params.get('search') or request.query_params.get('q') or '').strip()
+        if search_query:
+            q_filter = (
+                models.Q(order_number__icontains=search_query) |
+                models.Q(user__email__icontains=search_query) |
+                models.Q(user__name__icontains=search_query) |
+                models.Q(tracking_number__icontains=search_query)
+            )
+            if search_query.isdigit() and int(search_query) <= max_pg_bigint:
+                q_filter |= models.Q(id=int(search_query))
+            queryset = queryset.filter(q_filter)
+
         paginator = StandardResultsSetPagination()
         paginated_orders = paginator.paginate_queryset(queryset, request)
         serializer = OrderListSerializer(paginated_orders, many=True)
@@ -737,49 +782,54 @@ class AdminOrderStatusUpdateView(APIView):
     permission_classes = [IsAdmin]
 
     def patch(self, request, pk):
-        order = get_object_or_404(Order.objects.select_related('user'), id=pk)
         serializer = AdminOrderStatusUpdateSerializer(data=request.data)
         if not serializer.is_valid():
-            return Response( {"success": False, "errors": serializer.errors},
+            return Response(
+                {"success": False, "errors": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
         new_status = serializer.validated_data['status']
         tracking_number = serializer.validated_data.get('tracking_number', None)
         carrier_name = serializer.validated_data.get('carrier_name', None)
         notes = serializer.validated_data.get('notes', '')
-
-        if not order.can_transition_to(new_status):
-            return Response(
-                {
-                    "success": False,
-                    "message": f"Cannot transition order from '{order.status}' to '{new_status}'.",
-                    "current_status": order.status,
-                    "requested_status": new_status
-                },
-                status=status.HTTP_400_BAD_REQUEST
+        with transaction.atomic():
+            order = get_object_or_404(
+                Order.objects.select_for_update().select_related('user'),
+                id=pk
             )
-
-        updated_fields = ['status', 'updated_at']
-        order.status = new_status
-
-        if new_status == Order.OrderStatus.SHIPPED:
-            if not carrier_name or not tracking_number:
+            if not order.can_transition_to(new_status):
                 return Response(
                     {
                         "success": False,
-                        "message": "carrier_name and tracking_number are required when marking an order as SHIPPED."
+                        "message": f"Cannot transition order from '{order.status}' to '{new_status}'.",
+                        "current_status": order.status,
+                        "requested_status": new_status
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            order.carrier_name = carrier_name
-            order.tracking_number = tracking_number
-            updated_fields.extend(['carrier_name', 'tracking_number'])
-
-        with transaction.atomic():
+            if new_status == Order.OrderStatus.CONFIRMED and order.payment_method == Order.PaymentMethod.RAZORPAY and order.payment_status != Order.PaymentStatus.COMPLETED:
+                return Response(
+                    {
+                        "success": False,
+                        "message": "Cannot confirm an unpaid Razorpay order. Customer must complete payment first."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            updated_fields = ['status', 'updated_at']
+            order.status = new_status
+            if new_status == Order.OrderStatus.SHIPPED:
+                if not carrier_name or not tracking_number:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": "carrier_name and tracking_number are required when marking an order as SHIPPED."
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                order.carrier_name = carrier_name
+                order.tracking_number = tracking_number
+                updated_fields.extend(['carrier_name', 'tracking_number'])
             order.save(update_fields=updated_fields)
-
             if new_status == Order.OrderStatus.DELIVERED:
                 for item in order.items.select_related('variant__inventory').all():
                     if item.variant and hasattr(item.variant, 'inventory'):
@@ -792,7 +842,6 @@ class AdminOrderStatusUpdateView(APIView):
                             reference_id=order.order_number,
                             description=f"Order {order.order_number} delivered to customer."
                         )
-
             if new_status == Order.OrderStatus.DELIVERED and order.payment_method == Order.PaymentMethod.COD:
                 order.payment_status = Order.PaymentStatus.COMPLETED
                 order.save(update_fields=['payment_status'])
@@ -802,31 +851,26 @@ class AdminOrderStatusUpdateView(APIView):
                     amount=order.grand_total,
                     status=PaymentTransaction.TransactionStatus.SUCCESS
                 )
-
             if new_status == Order.OrderStatus.CANCELLED:
                 if order.payment_status == Order.PaymentStatus.COMPLETED:
-                    wallet, _ = Wallet.objects.get_or_create(user=order.user)
+                    wallet, _ = Wallet.objects.select_for_update().get_or_create(user=order.user)
                     wallet.credit(
                         amount=order.grand_total,
                         source=WalletTransaction.TransactionSource.ORDER_REFUND,
                         reference_id=order.order_number,
                         description=f"Automated refund for order {order.order_number} cancelled by admin"
                     )
-
                     order.payment_status = Order.PaymentStatus.REFUNDED
                 elif order.payment_status == Order.PaymentStatus.PENDING:
                     order.payment_status = Order.PaymentStatus.FAILED
-
                 order.cancellation_reason = notes or "Cancelled by administrator"
                 order.cancelled_at = timezone.now()
                 order.save(update_fields=['payment_status', 'cancellation_reason', 'cancelled_at'])
-
                 for item in order.items.select_related('variant__inventory').all():
                     if item.variant and hasattr(item.variant, 'inventory'):
                         inv = Inventory.objects.select_for_update().get(id=item.variant.inventory.id)
                         inv.quantity += item.quantity
                         inv.save(update_fields=['quantity', 'updated_at'])
-
                         InventoryTransaction.objects.create(
                             inventory=inv,
                             transaction_type=InventoryTransaction.TransactionType.ORDER_CANCELLED,
@@ -835,59 +879,37 @@ class AdminOrderStatusUpdateView(APIView):
                             reference_id=order.order_number,
                             description=f"Stock restored: Order {order.order_number} cancelled by admin"
                         )
-
                         release_redis_stock(sku=item.sku_snapshot, quantity=item.quantity)
-                if order.coupon:
+                if order.coupon_id:
                     CouponUsage.objects.filter(order=order, user=order.user).delete()
                     Coupon.objects.filter(id=order.coupon_id, times_used__gt=0).update(times_used=models.F('times_used') - 1)
-
             milestone_notes = notes or f"Order status updated to {new_status} by admin."
             OrderTrackingMilestone.objects.create(
                 order=order,
                 status=new_status,
-                notes=milestone_notes
+                notes=milestone_notes[:100]
             )
-
-            if new_status == Order.OrderStatus.SHIPPED:
-                send_dynamic_email(
-                    recipient_email=order.user.email,
-                    template_key='ORDER_SHIPPED',
+            email_payloads = {
+                Order.OrderStatus.SHIPPED: ('ORDER_SHIPPED', f"Your Order #{order.order_number} has been Shipped!", 'Order Shipped!'),
+                Order.OrderStatus.DELIVERED: ('ORDER_DELIVERED', f"Delivered: Order #{order.order_number}", 'Order Delivered'),
+                Order.OrderStatus.CANCELLED: ('ORDER_CANCELLED', f"Order Cancelled: #{order.order_number}", 'Order Cancelled by Store'),
+            }
+            if new_status in email_payloads:
+                tpl_key, subject, headline = email_payloads[new_status]
+                customer_email = order.user.email
+                customer_name = getattr(order.user, 'name', None) or customer_email
+                transaction.on_commit(lambda: send_dynamic_email(
+                    recipient_email=customer_email,
+                    template_key=tpl_key,
                     fallback_file='order_status_update.html',
-                    default_subject=f"Your Order #{order.order_number} has been Shipped!",
+                    default_subject=subject,
                     context_dict={
                         'order': order,
-                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
-                        'headline': 'Order Shipped! 🚀'
+                        'customer_name': customer_name,
+                        'headline': headline
                     }
-                )
-            elif new_status == Order.OrderStatus.DELIVERED:
-                send_dynamic_email(
-                    recipient_email=order.user.email,
-                    template_key='ORDER_DELIVERED',
-                    fallback_file='order_status_update.html',
-                    default_subject=f"Delivered: Order #{order.order_number}",
-                    context_dict={
-                        'order': order,
-                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
-                        'headline': 'Order Delivered 🎉'
-                    }
-                )
-
-            elif new_status == Order.OrderStatus.CANCELLED:
-                send_dynamic_email(
-                    recipient_email=order.user.email,
-                    template_key='ORDER_CANCELLED',
-                    fallback_file='order_status_update.html',
-                    default_subject=f"Order Cancelled: #{order.order_number}",
-                    context_dict={
-                        'order': order,
-                        'customer_name': getattr(order.user, 'name', None) or order.user.email,
-                        'headline': 'Order Cancelled by Store'
-                    }
-                )
-            
+                ))
             invalidate_dashboard_cache()
-
             return Response(
                 {
                     "success": True,
@@ -907,13 +929,6 @@ class AdminReturnModerateView(APIView):
     permission_classes = [IsAdmin]
 
     def patch(self, request, pk):
-        return_request = get_object_or_404(
-            ReturnRequest.objects.select_related(
-                'order__user', 'order__coupon', 'user'
-            ).prefetch_related('order__items__variant__inventory'),
-            id=pk
-        )
-
         serializer = AdminReturnModerateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
@@ -921,22 +936,27 @@ class AdminReturnModerateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if return_request.status != ReturnRequest.ReturnStatus.PENDING:
-            return Response(
-                {
-                    "success": False,
-                    "message": f"This return request has already been '{return_request.status}'. Cannot moderate again."
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         new_status = serializer.validated_data['status']
         admin_notes = serializer.validated_data.get('admin_notes', '')
         admin_restock_override = serializer.validated_data.get('restock', None)
 
-        order = return_request.order
-
         with transaction.atomic():
+            return_request = get_object_or_404(
+                ReturnRequest.objects.select_for_update().select_related('user'),
+                id=pk
+            )
+
+            if return_request.status != ReturnRequest.ReturnStatus.PENDING:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"This return request has already been '{return_request.status}'. Cannot moderate again."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            order = Order.objects.select_for_update().select_related('user').get(pk=return_request.order_id)
+
             return_request.status = new_status
             return_request.admin_notes = admin_notes
             return_request.reviewed_at = timezone.now()
@@ -947,7 +967,7 @@ class AdminReturnModerateView(APIView):
             if new_status == ReturnRequest.ReturnStatus.APPROVED:
 
                 if return_request.return_type == ReturnRequest.ReturnType.REFUND:
-                    wallet, _ = Wallet.objects.get_or_create(user=order.user)
+                    wallet, _ = Wallet.objects.select_for_update().get_or_create(user=order.user)
                     wallet.credit(
                         amount=order.grand_total,
                         source=WalletTransaction.TransactionSource.ORDER_REFUND,
@@ -991,7 +1011,7 @@ class AdminReturnModerateView(APIView):
                     ReturnRequest.ReturnReason.WRONG_ITEM,
                 ]
 
-                if return_request.reason_type in merchant_fault_reasons and order.coupon:
+                if return_request.reason_type in merchant_fault_reasons and order.coupon_id:
                     CouponUsage.objects.filter(order=order, user=order.user).delete()
                     Coupon.objects.filter(id=order.coupon_id, times_used__gt=0).update(times_used=models.F('times_used') - 1)
 
@@ -1000,7 +1020,7 @@ class AdminReturnModerateView(APIView):
 
                 milestone_msg = f"Return approved by admin. Items {'restocked' if items_restocked else 'written off / discarded (damaged)'}."
                 if admin_notes:
-                    milestone_msg += f"Note: {admin_notes}"
+                    milestone_msg += f" Note: {admin_notes}"
 
                 OrderTrackingMilestone.objects.create(
                     order=order,
@@ -1020,20 +1040,20 @@ class AdminReturnModerateView(APIView):
                     notes=rejection_msg[:100]
                 )
 
-        send_dynamic_email(
-            recipient_email=return_request.user.email,
-            template_key='RETURN_STATUS',
-            fallback_file='return_status.html',
-            default_subject=f"Return Request {return_request.get_status_display()}: #{order.order_number}",
-            context_dict={
-                'order': order,
-                'customer_name': getattr(return_request.user, 'name', None) or return_request.user.email,
-                'return_status': return_request.status,
-                'admin_notes': return_request.admin_notes or ''
-            }
-        )
+            transaction.on_commit(lambda: send_dynamic_email(
+                recipient_email=return_request.user.email,
+                template_key='RETURN_STATUS',
+                fallback_file='return_status.html',
+                default_subject=f"Return Request {return_request.get_status_display()}: #{order.order_number}",
+                context_dict={
+                    'order': order,
+                    'customer_name': getattr(return_request.user, 'name', None) or return_request.user.email,
+                    'return_status': return_request.status,
+                    'admin_notes': return_request.admin_notes or ''
+                }
+            ))
 
-        invalidate_dashboard_cache()
+            invalidate_dashboard_cache()
 
         return Response(
             {
@@ -1051,7 +1071,6 @@ class AdminReturnModerateView(APIView):
             },
             status=status.HTTP_200_OK
         )
-
 
 
 class WalletBalanceView(APIView):
@@ -1167,14 +1186,18 @@ class WalletTopUpVerifyView(APIView):
 
         try:
             rp_order = razorpay_client.order.fetch(razorpay_order_id)
-            credit_amount = Decimal(rp_order['amount'] / Decimal(100))
         except Exception:
-            credit_amount = serializer.validated_data.get('amount')
-            if not credit_amount:
-                return Response(
-                    {"success": False, "message": "Could not determine top-up amount from payment provider."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+            return Response(
+                {"success": False, "message": "Could not verify top-up order details with Razorpay. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+        notes = rp_order.get('notes') or {}
+        if notes.get('type') != 'WALLET_TOPUP' or str(notes.get('user_id')) != str(request.user.id):
+            return Response(
+                {"success": False, "message": "This Razorpay order does not belong to your wallet top-up session."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        credit_amount = (Decimal(str(rp_order['amount'])) / Decimal('100')).quantize(Decimal('0.01'))
 
         with transaction.atomic():
             wallet, _ = Wallet.objects.select_for_update().get_or_create(user=request.user)
@@ -1332,7 +1355,7 @@ class AdminCouponDetailView(APIView):
 
 
 class CustomerEligibleCouponsView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsCustomer]
 
     def get(self, request):
         now = timezone.now()
@@ -1340,8 +1363,10 @@ class CustomerEligibleCouponsView(APIView):
             '-created_at'
         )
 
-        serializer = CustomerCouponSerializer(queryset, many=True, context={'request': request})
-        return Response({"success": True, "count": queryset.count(), "data": serializer.data}, status=status.HTTP_200_OK)
+        paginator = StandardResultsSetPagination()
+        paginated_result = paginator.paginate_queryset(queryset, request)
+        serializer = CustomerCouponSerializer(paginated_result, many=True, context={'request': request})
+        return paginator.get_paginated_response(serializer.data)
 
 
 class AdminReturnRequestListView(APIView):
@@ -1358,7 +1383,7 @@ class AdminReturnRequestListView(APIView):
                 return Response(
                     {
                         "success": False,
-                        "message": f"Invalid status '{status_param}. Valid values: {valid_statuses}"
+                        "message": f"Invalid status '{status_param}'. Valid values: {valid_statuses}"
                     },
                     status=status.HTTP_400_BAD_REQUEST
                 )
@@ -1418,7 +1443,7 @@ class OrderInvoiceView(APIView):
         queryset = queryset.select_related('user').prefetch_related('items', 'payments')
 
         if str(identifier).isdigit():
-            order = get_object_or_404(queryset, id=int(identifier))
+            order = get_object_or_404(queryset, **_order_lookup(identifier))
         else:
             order = get_object_or_404(queryset, order_number=identifier)
         
@@ -1437,9 +1462,14 @@ class AdminWalletTransactionListView(APIView):
     def get(self, request):
         queryset = WalletTransaction.objects.select_related('wallet__user').order_by('-created_at')
 
-        user_id = request.query_params.get('user_id')
+        user_id = (request.query_params.get('user_id') or '').strip()
         if user_id:
-            queryset = queryset.filter(wallet__user_id=user_id)
+            if not user_id.isdigit() or int(user_id) > MAX_PG_BIGINT:
+                return Response(
+                    {"success": False, "message": "Invalid user_id parameter."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            queryset = queryset.filter(wallet__user_id=int(user_id))
 
         transaction_type = request.query_params.get('type')
         if transaction_type:
@@ -1671,7 +1701,7 @@ class AdminDashboardSalesChartView(APIView):
                 total_period_orders += orders_count
 
                 chart_data.append({
-                    "data": formatted_month_string,
+                    "date": formatted_month_string,
                     "revenue": str(revenue_amount.quantize(Decimal('0.01'))),
                     "orders_count": orders_count
                 })

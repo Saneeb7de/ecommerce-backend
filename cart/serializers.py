@@ -87,12 +87,12 @@ class AddToCartSerializer(serializers.Serializer):
 
         # 1. Fetch variant with related product and warehouse inventory
         try:
-            variant = ProductVariant.objects.select_related('product', 'inventory').get(pk=variant_id)
+            variant = ProductVariant.objects.select_related('product__category', 'inventory').get(pk=variant_id)
         except ProductVariant.DoesNotExist:
             raise serializers.ValidationError({"variant_id": f"Product variant with id '{variant_id}' does not exist."})
 
         # 2. Check if product is active and not soft-deleted
-        if not variant.is_active or variant.product.is_deleted or not variant.product.is_published:
+        if not variant.is_active or variant.product.is_deleted or not variant.product.is_published or not variant.product.category.is_active:
             raise serializers.ValidationError({"variant_id": "This product variant is currently unavailable."})
 
         # 3. Check warehouse stock availability
@@ -153,7 +153,10 @@ class WishlistItemSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
     def get_is_in_stock(self, obj):
-        return obj.product.variants.filter(is_active=True, inventory__quantity__gt=0).exists()
+        return any(
+            v.is_active and hasattr(v, 'inventory') and v.inventory.available_quantity > 0
+            for v in obj.product.variants.all()
+        )
 
 
 class WishlistToggleSerializer(serializers.Serializer):
