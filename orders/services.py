@@ -10,30 +10,16 @@ class PricingEngine:
     - Line item calculations & live warehouse stock verification
     - Subtotal calculation
     - Tiered shipping fee (Free for orders >= ₹1,000, else ₹100)
-    - Coupon discounts (e.g., WELCOME10 for 10% off)
     - 18% GST tax calculation on net taxable amount
     - Grand total calculation
     - Cash on Delivery (COD) limit enforcement (Max ₹50,000)
+    - Coupon discounts (via database-managed Coupon records)
     """
 
     FREE_SHIPPING_THRESHOLD = Decimal('1000.00')
     STANDARD_SHIPPING_FEE = Decimal('100.00')
     TAX_RATE = Decimal('0.18')       # 18% GST
     COD_MAX_LIMIT = Decimal('50000.00')
-
-    # Basic promotional coupon definitions
-    SUPPORTED_COUPONS = {
-        'WELCOME10': {
-            'type': 'PERCENTAGE',
-            'value': Decimal('10.00'),  # 10% off
-            'min_spend': Decimal('500.00'),
-        },
-        'FLAT50': {
-            'type': 'FLAT',
-            'value': Decimal('50.00'),   # Flat ₹50 off
-            'min_spend': Decimal('300.00'),
-        }
-    }
 
     @classmethod
     def calculate_cart_totals(cls, cart, coupon_code=None, user=None):
@@ -42,7 +28,7 @@ class PricingEngine:
         the complete authoritative financial breakdown for checkout.
         """
         # 1. Fetch line items with prefetching to avoid N+1 queries
-        items = cart.items.select_related('variant__product', 'variant__inventory').all()
+        items = cart.items.select_related('variant__product__category', 'variant__inventory').all()
         if not items.exists():
             raise ValidationError("Your cart is empty. Add items before checking out.")
 
@@ -52,7 +38,7 @@ class PricingEngine:
         # 2. Revalidate live stock & active status for every item
         for item in items:
             variant = item.variant
-            if not variant or not variant.is_active or variant.product.is_deleted or not variant.product.is_published:
+            if not variant or not variant.is_active or variant.product.is_deleted or not variant.product.is_published or not variant.product.category.is_active:
                 raise ValidationError(f"Item '{variant.sku if variant else 'Unknown'}' is currently unavailable.")
 
             available_qty = variant.inventory.available_quantity if hasattr(variant, 'inventory') else 0
@@ -91,20 +77,6 @@ class PricingEngine:
                     raise ValidationError(error_msg)
                 discount_amount = db_coupon.calculate_discount(subtotal)
                 applied_coupon = db_coupon.code
-            elif code in cls.SUPPORTED_COUPONS:
-                coupon_data = cls.SUPPORTED_COUPONS[code]
-                if subtotal >= coupon_data['min_spend']:
-                    applied_coupon = code
-                    if coupon_data['type'] == 'PERCENTAGE':
-                        discount_amount = (subtotal * (coupon_data['value'] / Decimal('100.00'))).quantize(
-                            Decimal('0.01'), rounding=ROUND_HALF_UP
-                        )
-                    elif coupon_data['type'] == 'FLAT':
-                        discount_amount = min(coupon_data['value'], subtotal)
-                else:
-                    raise ValidationError(
-                        f"Coupon '{code}' requires a minimum spend of ₹{coupon_data['min_spend']}."
-                    )
             else:
                 raise ValidationError(f"Invalid or expired coupon code '{coupon_code}'.")
 

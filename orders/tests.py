@@ -1,5 +1,8 @@
+from datetime import timedelta
+
 from django.test import TestCase
 from decimal import Decimal
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from users.models import User
 from catalog.models import Category, Product, ProductVariant, Inventory
@@ -68,6 +71,17 @@ class PricingEngineTDDTestCase(TestCase):
 
         # 4. Shopping Cart
         self.cart = Cart.objects.get_or_create(user=self.customer)[0]
+
+        # 5. Test coupon in DB
+        from orders.models import Coupon
+        self.coupon_welcome10 = Coupon.objects.create(
+        code='WELCOME10',
+        discount_type='PERCENTAGE',
+        discount_value=Decimal('10.00'),
+        min_order_amount=Decimal('500.00'),
+        end_date=timezone.now() + timedelta(days=365),
+        is_active=True
+    )
 
     def test_tiered_shipping_fee_below_threshold(self):
         """

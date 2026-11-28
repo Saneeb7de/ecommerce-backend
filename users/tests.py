@@ -311,6 +311,10 @@ class AuthenticationTests(APITestCase):
         refresh_url = reverse("auth-refresh-token")
         refresh_res = self.client.post(refresh_url, {"refresh": refresh_token_str}, format="json")
 
+        profile_url = reverse("customer-profile")
+        profile_res = self.client.get(profile_url)
+        self.assertEqual(profile_res.status_code, status.HTTP_401_UNAUTHORIZED)
+
         # Must be rejected with 401 Unauthorized!
         self.assertEqual(refresh_res.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertIn("error", refresh_res.data)

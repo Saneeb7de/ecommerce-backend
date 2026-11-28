@@ -117,13 +117,18 @@ class CartItemDetailView(APIView):
     def get_object(self, request, pk):
         # Security: customer can only modify their OWN cart items
         return get_object_or_404(
-            CartItem.objects.select_related('cart', 'variant__inventory', 'variant__product'),
+            CartItem.objects.select_related('cart', 'variant__inventory', 'variant__product__category'),
             pk=pk,
             cart__user=request.user
         )
 
     def patch(self, request, pk):
         item = self.get_object(request, pk)
+        if not item.variant.is_active or item.variant.product.is_deleted or not item.variant.product.is_published or not item.variant.product.category.is_active:
+            return Response(
+                {"success": False, "message": "This product variant is no longer available."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         serializer = UpdateCartItemQuantitySerializer(data=request.data)
         if not serializer.is_valid():
             return Response({
@@ -235,6 +240,11 @@ class WishlistToggleView(APIView):
                 status=status.HTTP_200_OK
             )
         else:
+            if not product.is_published or not product.category.is_active:
+                return Response(
+                    {"success": False, "message": "This product is currently unavailable."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             Wishlist.objects.create(user=request.user, product=product)
             return Response(
                 {

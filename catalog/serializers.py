@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.utils.text import slugify
+from decimal import Decimal
 
 from .models import Category, Product, ProductVariant, Inventory, InventoryTransaction
 
@@ -19,11 +20,17 @@ class CategorySerializer(serializers.ModelSerializer):
 
     def validate_name(self, value):
         slug = slugify(value)
+        if not slug:
+            raise serializers.ValidationError("Category name must contain letters or numbers.")
         qs = Category.objects.filter(slug=slug)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError(f"A category with the name '{value}' already exists.")
+        return value
+    def validate_parent(self, value):
+        if self.instance and value and value.pk == self.instance.pk:
+            raise serializers.ValidationError("A category cannot be its own parent.")
         return value
 
 class CategoryTreeSerializer(serializers.ModelSerializer):
@@ -138,10 +145,15 @@ class ProductVariantWriteSerializer(serializers.ModelSerializer):
                 sale_price = self.instance.sale_price
             if 'regular_price' not in data:
                 regular_price = self.instance.regular_price
-
+        if regular_price is not None and regular_price <= Decimal('0.00'):
+            raise serializers.ValidationError({"regular_price": "Regular price must be greater than zero."})
+        if sale_price is not None and sale_price < Decimal('0.00'):
+            raise serializers.ValidationError({"sale_price": "Sale price cannot be negative."})
+        
         if sale_price is not None and regular_price is not None and sale_price > regular_price:
             raise serializers.ValidationError({"sale_price": "Sale price cannot be greater than regular price."})
         return data
+    
 
 
 
@@ -174,9 +186,8 @@ class ProductListSerializer(serializers.ModelSerializer):
             return None
         return str(min(v.effective_price for v in active_variants))
     def get_is_in_stock(self, obj):
-        # 🚀 In-memory evaluation using prefetched inventory (0 extra queries):
         return any(
-            v.is_active and hasattr(v, 'inventory') and v.inventory.quantity > 0
+            v.is_active and hasattr(v, 'inventory') and v.inventory.available_quantity > 0
             for v in obj.variants.all()
         )
 
@@ -187,10 +198,14 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     Includes all variants with their inventory snapshots.
     """
     category = CategorySerializer(read_only=True)  # <-- Keeps it lightweight & fast
-    variants = ProductVariantSerializer(many=True, read_only=True)
+    variants = serializers.SerializerMethodField()
     class Meta:
         model = Product
         exclude = ['is_deleted']
+
+    def get_variants(self, obj):
+        active_variants = [v for v in obj.variants.all() if v.is_active]
+        return ProductVariantSerializer(active_variants, many=True).data
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -223,24 +238,34 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         if len(value) < 2:
             raise serializers.ValidationError("A product must have at least 2 gallery images. (plus 1 primary_image = minimum 3 photos total).")
         for url in value:
-            if not isinstance(url, str) or not url.startswith('http'):
+            if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
                 raise serializers.ValidationError(f"Each gallery image must be a valid URL string. Got: {url!r}")
         return value
 
     def validate(self, data):
-        """
-        Cross-field validator: runs after all individual field validators.
-        Ensures name uniqueness only among non-deleted products.
-        (The DB UniqueConstraint handles this at DB level, but we give a
-        clean API error message here before it reaches the DB.)
-        """
         name = data.get('name')
         if name:
-            qs = Product.objects.filter(name=name, is_deleted=False)
+            slug = slugify(name)
+            if not slug:
+                raise serializers.ValidationError({"name": "Product name must contain letters or numbers."})
+            name_qs = Product.objects.filter(name=name, is_deleted=False)
+            slug_qs = Product.objects.filter(slug=slug)
             if self.instance:
-                qs = qs.exclude(pk=self.instance.pk)
-            if qs.exists():
+                name_qs = name_qs.exclude(pk=self.instance.pk)
+                slug_qs = slug_qs.exclude(pk=self.instance.pk)
+            if name_qs.exists() or slug_qs.exists():
                 raise serializers.ValidationError({"name": f"A product with the name '{name}' already exists."})
+        # Enforce 3-photo rule even when gallery_images is omitted on POST
+        if not self.instance:
+            gallery = data.get('gallery_images')
+            if not gallery or len(gallery) < 2:
+                raise serializers.ValidationError({
+                    "gallery_images": "A product must have at least 2 gallery images (plus 1 primary_image = minimum 3 photos total)."
+                })
+        # Prevent attaching a product to a soft-deleted/inactive category
+        category = data.get('category')
+        if category and not category.is_active:
+            raise serializers.ValidationError({"category": "Cannot assign a product to an inactive category."})
         return data
 
 class AdminProductDetailSerializer(serializers.ModelSerializer):

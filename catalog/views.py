@@ -86,7 +86,7 @@ class CustomerProductListView(APIView):
         # 2. Category Filter (slug or ID)
         category_param = request.query_params.get('category', '').strip()
         if category_param:
-            if category_param.isdigit():
+            if category_param.isdigit() and int(category_param) <= 9223372036854775807:
                 query_set = query_set.filter(Q(category_id=category_param) | Q(category__parent_id=category_param))
             else:
                 query_set = query_set.filter(Q(category__slug=category_param) | Q(category__parent__slug=category_param))
@@ -334,7 +334,13 @@ class AdminProductListCreateView(APIView):
     def post(self, request):
         serializer = ProductCreateUpdateSerializer(data=request.data)
         if serializer.is_valid():
-            product = serializer.save()
+            try:
+                product = serializer.save()
+            except IntegrityError:
+                return Response(
+                    {"success": False, "errors": {"name": ["A product with this name or slug already exists."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             # 💡 If the new product is featured, clear featured cache:
             if product.is_featured:
                 cache.delete("catalog:featured_product")
@@ -419,17 +425,49 @@ class AdminProductVariantListCreateView(APIView):
         product = get_object_or_404(Product, pk=product_id, is_deleted=False)
         serializer = ProductVariantWriteSerializer(data=request.data, context={'product': product})
         if serializer.is_valid():
-            # Save the new variant attached to the parent product
+            raw_initial_stock = request.data.get('initial_stock', 0)
+            if isinstance(raw_initial_stock, bool):
+                return Response(
+                    {"success": False, "errors": {"initial_stock": ["initial_stock must be a valid integer."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                initial_stock = int(raw_initial_stock)
+            except (TypeError, ValueError):
+                return Response(
+                    {"success": False, "errors": {"initial_stock": ["initial_stock must be a valid integer."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if initial_stock < 0:
+                return Response(
+                    {"success": False, "errors": {"initial_stock": ["initial_stock cannot be negative."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            raw_threshold = request.data.get('low_stock_threshold', 5)
+            if isinstance(raw_threshold, bool):
+                return Response(
+                    {"success": False, "errors": {"low_stock_threshold": ["low_stock_threshold must be a valid integer."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                low_stock_threshold = int(raw_threshold)
+            except (TypeError, ValueError):
+                return Response(
+                    {"success": False, "errors": {"low_stock_threshold": ["low_stock_threshold must be a valid integer."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if low_stock_threshold < 0:
+                return Response(
+                    {"success": False, "errors": {"low_stock_threshold": ["low_stock_threshold cannot be negative."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             variant = serializer.save(product=product)
-            # 💡 Purge PDP cache so the new variant shows up on the storefront:
             cache.delete(f"catalog:product:{product.slug}")
-
-            # Auto-initialize warehouse inventory with 0 stock
-            initial_stock = int(request.data.get('initial_stock', 0))
             inventory = Inventory.objects.create(
                 variant=variant,
                 quantity=initial_stock,
                 reserved_quantity=0,
+                low_stock_threshold=low_stock_threshold,
             )
 
             # If initial stock was provided, create an initial ledger entry
@@ -539,12 +577,28 @@ class AdminInventoryStockAdjustView(APIView):
                 {"success": False, "message": "'sku' and 'adjustment_quantity' are required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        try:
-            adjustment_quantity = int(adjustment_quantity)
-        except ValueError:
+        if isinstance(adjustment_quantity, bool):
             return Response(
                 {"success": False, "message": "'adjustment_quantity' must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            adjustment_quantity = int(adjustment_quantity)
+        except (TypeError, ValueError):
+            return Response(
+                {"success": False, "message": "'adjustment_quantity' must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if adjustment_quantity == 0:
+            return Response(
+                {"success": False, "message": "'adjustment_quantity' cannot be zero."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        transaction_type = str(transaction_type).strip().upper()
+        valid_types = [choice[0] for choice in InventoryTransaction.TransactionType.choices]
+        if transaction_type not in valid_types:
+            return Response(
+                {"success": False, "message": f"Invalid transaction_type. Valid values: {valid_types}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

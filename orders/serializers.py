@@ -239,6 +239,15 @@ class CouponSerializer(serializers.ModelSerializer):
         if per_usage_limit > usage_limit:
             raise serializers.ValidationError({"per_usage_limit": "Per-user usage limit cannot exceed the global usage limit."})
 
+        min_order_amount = attrs.get('min_order_amount', getattr(self.instance, 'min_order_amount', Decimal('0.00')))
+        max_discount_amount = attrs.get('max_discount_amount', getattr(self.instance, 'max_discount_amount', None))
+        if min_order_amount is not None and min_order_amount < Decimal('0.00'):
+            raise serializers.ValidationError({"min_order_amount": "Minimum order amount cannot be negative."})
+        if max_discount_amount is not None and max_discount_amount <= Decimal('0.00'):
+            raise serializers.ValidationError({"max_discount_amount": "Maximum discount cap must be greater than zero."})
+        if usage_limit < 1 or per_usage_limit < 1:
+            raise serializers.ValidationError({"usage_limit": "Usage limits must be at least 1."})
+
         return attrs
 
 
